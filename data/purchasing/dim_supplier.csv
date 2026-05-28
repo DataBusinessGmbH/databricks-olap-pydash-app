@@ -1,0 +1,5 @@
+supplier_key,supplier_name,supplier_region,payment_terms
+301,Atlas Metals,North America,Net 30
+302,ResinWorks,Europe,Net 45
+303,PackRight,Asia,Net 30
+304,BoltHub,North America,Net 15

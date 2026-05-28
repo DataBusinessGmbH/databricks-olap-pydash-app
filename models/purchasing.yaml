@@ -1,0 +1,100 @@
+model_name: Purchasing Model
+
+fact:
+  name: fact_purchases
+  source: data/purchasing/fact_purchases.csv
+  join_keys:
+    - date_key
+    - product_key
+    - supplier_key
+    - buyer_key
+  metrics:
+    - name: unit_cost
+      label: Unit Cost
+      type: numeric
+      default_agg: avg
+      allowed_aggs: [sum, avg, min, max, count]
+    - name: quantity
+      label: Quantity
+      type: numeric
+      default_agg: sum
+      allowed_aggs: [sum, avg, min, max, count]
+    - name: freight_cost
+      label: Freight Cost
+      type: numeric
+      default_agg: sum
+      allowed_aggs: [sum, avg, min, max, count]
+    - name: total_cost
+      label: Total Cost
+      type: numeric
+      default_agg: sum
+      allowed_aggs: [sum, avg, min, max, count]
+
+dimensions:
+  - name: Date
+    table: dim_purchase_date
+    source: data/purchasing/dim_purchase_date.csv
+    fact_key: date_key
+    dim_key: date_key
+    display_key: date_dim_key
+    attributes:
+      - name: year
+        label: Year
+        type: integer
+      - name: quarter
+        label: Quarter
+        type: string
+      - name: month
+        label: Month
+        type: integer
+
+  - name: Product
+    table: dim_purchase_product
+    source: data/purchasing/dim_purchase_product.csv
+    fact_key: product_key
+    dim_key: product_key
+    display_key: product_dim_key
+    attributes:
+      - name: sku
+        label: SKU
+        type: string
+      - name: product_name
+        label: Product Name
+        type: string
+      - name: category
+        label: Category
+        type: string
+
+  - name: Supplier
+    table: dim_supplier
+    source: data/purchasing/dim_supplier.csv
+    fact_key: supplier_key
+    dim_key: supplier_key
+    display_key: supplier_dim_key
+    attributes:
+      - name: supplier_name
+        label: Supplier Name
+        type: string
+      - name: supplier_region
+        label: Supplier Region
+        type: string
+      - name: payment_terms
+        label: Payment Terms
+        type: string
+
+  - name: Buyer
+    table: dim_buyer
+    source: data/purchasing/dim_buyer.csv
+    fact_key: buyer_key
+    dim_key: buyer_key
+    display_key: buyer_dim_key
+    attributes:
+      - name: buyer_name
+        label: Buyer Name
+        type: string
+      - name: department
+        label: Department
+        type: string
+      - name: location
+        label: Location
+        type: string
