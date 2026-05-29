@@ -81,6 +81,7 @@ class OlapQueryRequest:
     columns: list[str] = field(default_factory=list)
     metrics: list[str] = field(default_factory=list)
     filters: dict[str, list] = field(default_factory=dict)
+    max_rows: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,10 @@ class OlapDatabase(Protocol):
 
     def flat_table(self) -> pd.DataFrame:
         """Return the fully joined, un-aggregated flat DataFrame."""
+        ...
+
+    def current_user(self) -> str:
+        """Return the current backend user, or a safe fallback."""
         ...
 
 
@@ -223,18 +228,26 @@ class OlapSqlBuilder:
                     f"SUM({fact_alias}.{self._q(metric.name)}) AS {self._q(metric.name)}"
                 )
 
-        group_by_cols.append("'1'")  # dummy group by to allow aggregation without dimensions
+        sql_parts = [
+            "SELECT",
+            "  " + ",\n  ".join(select_cols),
+            f"FROM {self._qualified_table_name(self._model.fact)} {fact_alias}",
+            *join_sql,
+        ]
 
-        return "\n".join(
-            [
-                "SELECT",
-                "  " + ",\n  ".join(select_cols),
-                f"FROM {self._qualified_table_name(self._model.fact)} {fact_alias}",
-                *join_sql,
-                "GROUP BY",
-                "  " + ",\n  ".join(group_by_cols),
-            ]
-        )
+        if group_by_cols:
+            sql_parts.extend(
+                [
+                    "GROUP BY",
+                    "  " + ",\n  ".join(group_by_cols),
+                ]
+            )
+
+        max_rows = self._resolve_max_rows(request)
+        if max_rows is not None:
+            sql_parts.append(f"LIMIT {max_rows}")
+
+        return "\n".join(sql_parts)
 
     def _qualified_table_name(self, table_def) -> str:
         parts = [
@@ -250,6 +263,18 @@ class OlapSqlBuilder:
     @staticmethod
     def _q(name: str) -> str:
         return f"`{name}`"
+
+    @staticmethod
+    def _resolve_max_rows(request: OlapQueryRequest | None) -> int | None:
+        if request is None or request.max_rows is None:
+            return None
+
+        try:
+            max_rows = int(request.max_rows)
+        except (TypeError, ValueError):
+            return None
+
+        return max_rows if max_rows > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +339,15 @@ class DatabricksSparkBackend:
 
         LOGGER.debug("Spark execute result shape=%s", df.shape)
         return df
+
+    def current_user(self) -> str:
+        try:
+            user_df = self._spark.sql("SELECT current_user() AS current_user").toPandas()
+            if not user_df.empty and "current_user" in user_df.columns:
+                return str(user_df.iloc[0]["current_user"])
+        except Exception:
+            LOGGER.warning("Failed to resolve Spark current user", exc_info=True)
+        return "Unknown user"
 
     # -- Private helpers -----------------------------------------------------
 
@@ -414,6 +448,22 @@ class DatabricksSqlBackend:
 
         LOGGER.debug("SQL execute result shape=%s", df.shape)
         return df
+
+    def current_user(self) -> str:
+        conn = None
+        try:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute("SELECT current_user() AS current_user")
+            row = cur.fetchone()
+            if row:
+                return str(row[0])
+        except Exception:
+            LOGGER.warning("Failed to resolve SQL current user", exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+        return "Unknown user"
 
     def _validate_config(self) -> None:
         missing = []

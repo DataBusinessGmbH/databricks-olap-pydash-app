@@ -29,6 +29,7 @@ fact:
     - name: total_cost
       label: Total Cost
       type: numeric
+      default_show: true      
       default_agg: sum
       allowed_aggs: [sum, avg, min, max, count]
 
@@ -40,10 +41,12 @@ dimensions:
     fact_key: date_key
     dim_key: date_key
     display_key: date_dim_key
+    default_show: true
     attributes:
       - name: year
         label: Year
         type: integer
+        default_show: true
       - name: quarter
         label: Quarter
         type: string

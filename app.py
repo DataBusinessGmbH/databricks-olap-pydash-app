@@ -16,11 +16,11 @@ import os
 
 import dash_ag_grid as dag
 import pandas as pd
-from dash import Dash, Input, Output, dcc, html, no_update
+from dash import Dash, Input, Output, State, dcc, html, no_update
 import dash
 
 from src.model import OlapModel, DimensionDef, MetricDef
-from src.db import OlapDatabase, OlapQueryRequest, create_databricks_backend
+from src.db import LOGGER, OlapDatabase, OlapQueryRequest, create_databricks_backend
 import logging
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,7 @@ import logging
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
+DEFAULT_MAX_ROWS = 1000
 
 
 def load_env_on_startup() -> None:
@@ -66,6 +67,8 @@ def discover_model_files() -> dict[str, Path]:
         raise FileNotFoundError(
             "No model YAML found. Add one under models/*.yaml."
         )
+    
+    LOGGER.info(f"Discovered model files: {model_files}")
 
     return model_files
 
@@ -89,8 +92,51 @@ def get_backend(model_id: str) -> OlapDatabase:
 
 
 def get_flat_table(model_id: str) -> pd.DataFrame:
-    request = OlapQueryRequest()
+    request = OlapQueryRequest(max_rows=DEFAULT_MAX_ROWS)
     return get_backend(model_id).execute(request)
+
+
+def sanitize_max_rows(value) -> int | None:
+    if value in (None, ""):
+        return DEFAULT_MAX_ROWS
+    try:
+        max_rows = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ROWS
+    return max_rows if max_rows > 0 else DEFAULT_MAX_ROWS
+
+
+def get_logged_in_user(model_id: str) -> str:
+    return get_backend(model_id).current_user()
+
+
+def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequest:
+    max_rows = sanitize_max_rows(max_rows_value)
+
+    if not column_state:
+        return OlapQueryRequest(max_rows=max_rows)
+
+    row_groups: list[str] = []
+    pivot_cols: list[str] = []
+
+    for col_state in column_state:
+        if col_state.get("hide"):
+            continue
+        if col_state.get("rowGroup"):
+            row_groups.append(col_state["colId"])
+            continue
+        if col_state.get("pivot"):
+            pivot_cols.append(col_state["colId"])
+            continue
+        row_groups.append(col_state["colId"])
+
+    return OlapQueryRequest(
+        rows=row_groups,
+        columns=pivot_cols,
+        metrics=[],
+        filters={},
+        max_rows=max_rows,
+    )
 
 
 def get_model_dropdown_options() -> list[dict[str, str]]:
@@ -234,6 +280,7 @@ app = Dash(__name__)
 
 initial_model = get_model(DEFAULT_MODEL_ID)
 initial_df = get_flat_table(DEFAULT_MODEL_ID)
+initial_user = get_logged_in_user(DEFAULT_MODEL_ID)
 
 app.layout = html.Div(
     style={
@@ -244,16 +291,60 @@ app.layout = html.Div(
         "margin": "0 auto",
     },
     children=[
-        html.H2("OLAP Slice & Dice (Drag & Drop)"),
         html.Div(
-            style={"marginBottom": "10px", "maxWidth": "320px"},
+            style={
+                "display": "flex",
+                "justifyContent": "space-between",
+                "alignItems": "center",
+                "gap": "16px",
+                "marginBottom": "12px",
+            },
             children=[
-                html.Div("Model", style={"fontWeight": "600", "marginBottom": "6px"}),
-                dcc.Dropdown(
-                    id="model-selector",
-                    options=get_model_dropdown_options(),
-                    value=DEFAULT_MODEL_ID,
-                    clearable=False,
+                html.H2("General Slice & Dice", style={"margin": 0}),
+                html.Div(
+                    [
+                        html.Span("Logged in user: ", style={"fontWeight": "600"}),
+                        html.Span(initial_user, id="logged-in-user"),
+                    ],
+                    style={"color": "#374151"},
+                ),
+            ],
+        ),
+        html.Div(
+            style={
+                "marginBottom": "10px",
+                "display": "flex",
+                "gap": "16px",
+                "alignItems": "end",
+                "flexWrap": "wrap",
+            },
+            children=[
+                html.Div(
+                    style={"maxWidth": "320px", "minWidth": "240px"},
+                    children=[
+                        html.Div("Model", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="model-selector",
+                            options=get_model_dropdown_options(),
+                            value=DEFAULT_MODEL_ID,
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"maxWidth": "180px"},
+                    children=[
+                        html.Div("Max rows", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Input(
+                            id="max-rows-input",
+                            type="number",
+                            min=1,
+                            step=1,
+                            value=DEFAULT_MAX_ROWS,
+                            debounce=True,
+                            style={"width": "100%", "padding": "8px"},
+                        ),
+                    ],
                 ),
             ],
         ),
@@ -293,21 +384,30 @@ app.layout = html.Div(
 @app.callback(
     Output("olap-grid", "rowData"),
     Output("olap-grid", "columnDefs"),
+    Output("logged-in-user", "children"),
     Input("model-selector", "value"),
+    Input("max-rows-input", "value"),
+    State("olap-grid", "columnState"),
 )
-def on_model_change(model_id: str):
+def on_model_change(model_id: str, max_rows_value, column_state):
     selected_model = get_model(model_id)
-    selected_df = get_flat_table(model_id)
-    return selected_df.to_dict("records"), build_column_defs(selected_df, selected_model)
+    request = build_request_from_grid_state(column_state, max_rows_value)
+    selected_df = get_backend(model_id).execute(request)
+    return (
+        selected_df.to_dict("records"),
+        build_column_defs(selected_df, selected_model),
+        get_logged_in_user(model_id),
+    )
 
 
 @app.callback(
     Output("olap-grid", "rowData", allow_duplicate=True),
     Input("olap-grid", "columnState"),
     Input("model-selector", "value"),
+    Input("max-rows-input", "value"),
     prevent_initial_call=True,
 )
-def on_grid_dimension_change(column_state, model_id: str):
+def on_grid_dimension_change(column_state, model_id: str, max_rows_value):
     """
     Triggered when user drags/drops dimensions to row group or pivot areas.
     
@@ -323,34 +423,11 @@ def on_grid_dimension_change(column_state, model_id: str):
 
     if not column_state:
         return no_update
-    
-    # Extract row group columns and pivot columns from column state
-    row_groups = []
-    pivot_cols = []
-    
-    for col_state in column_state:
-        if col_state.get("hide"):
-            continue  # Skip hidden columns
-        if col_state.get("rowGroup"):
-            row_groups.append(col_state["colId"])
-            continue
-        if col_state.get("pivot"):
-            pivot_cols.append(col_state["colId"])
-            continue
-        row_groups.append(col_state["colId"])
 
-    logger.info(f"Row groups: {row_groups}")
-    logger.info(f"Pivot columns: {pivot_cols}")
-
-    # Query backend with the new dimensions
-    request = OlapQueryRequest(
-        rows=row_groups,
-        columns=pivot_cols,
-        metrics=[],  # empty → use all metrics
-        filters={},
-    )
+    request = build_request_from_grid_state(column_state, max_rows_value)
+    logger.info(f"Row groups: {request.rows}")
+    logger.info(f"Pivot columns: {request.columns}")
     
-    selected_model = get_model(model_id)
     backend = get_backend(model_id)
     result_df = backend.execute(request)
     
