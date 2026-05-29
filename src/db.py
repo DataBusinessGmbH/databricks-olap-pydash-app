@@ -355,7 +355,8 @@ class DatabricksSparkBackend:
                 "pyspark is not available. This backend must run inside Databricks workspace."
             ) from ex """
         
-        spark = DatabricksSession.builder.getOrCreate()        
+        #spark = DatabricksSession.builder.getOrCreate()        
+        spark = DatabricksSession.builder.serverless().getOrCreate()
 
         #spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
         if spark is None:
