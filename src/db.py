@@ -34,7 +34,7 @@ import importlib
 import logging
 import os
 from typing import Protocol
-from pyspark.sql import SparkSession
+from databricks.connect import DatabricksSession
 
 import pandas as pd
 
@@ -345,15 +345,19 @@ class DatabricksSparkBackend:
 
     @staticmethod
     def _get_spark_session():
+
+        """
         try:
             spark_mod = importlib.import_module("pyspark.sql")
             SparkSession = getattr(spark_mod, "SparkSession")
         except Exception as ex:
             raise RuntimeError(
                 "pyspark is not available. This backend must run inside Databricks workspace."
-            ) from ex
+            ) from ex """
+        
+        spark = DatabricksSession.builder.getOrCreate()        
 
-        spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+        #spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
         if spark is None:
             raise RuntimeError("No active Spark session found in current runtime.")
         return spark
