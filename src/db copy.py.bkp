@@ -131,21 +131,274 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
 
 # ---------------------------------------------------------------------------
-# Shared SQL Builder (used by both Spark and SQL backends)
+# Databricks Spark Backend
 # ---------------------------------------------------------------------------
 
-class OlapSqlBuilder:
+class DatabricksSparkBackend:
     """
-    Builds SQL queries for OLAP requests, independent of execution engine.
-    Used by both DatabricksSparkBackend (executes via spark.sql) and 
-    DatabricksSqlBackend (executes via SQL connector).
+    Implements OlapDatabase using tables available in the Databricks workspace
+    where the app is running.
+
+    It reads model table metadata (catalog/schema/table), loads Spark tables,
+    joins them, and returns pandas DataFrames to the frontend.
     """
 
-    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig) -> None:
+    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
         self._model = model
-        self._config = config
+        self._config = config or load_databricks_config_from_env()
+        self._flat: pd.DataFrame | None = None  # lazy cache
+        self._spark = self._get_spark_session()
+        LOGGER.info("Initialized Spark backend for model=%s", self._model.name)
 
-    def build_sql(self, request: OlapQueryRequest | None = None) -> str:
+    # -- Public interface ----------------------------------------------------
+
+    def flat_table(self) -> pd.DataFrame:
+        """
+        Return the fully joined flat table with synthetic display keys added.
+        Result is cached — Spark join is executed once per process.
+        """
+        if self._flat is None:
+            LOGGER.info("Building Spark flat table for model=%s", self._model.name)
+            self._flat = self._build_flat_table()
+            LOGGER.info("Spark flat table built: shape=%s", self._flat.shape)
+        return self._flat
+
+    def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
+        """
+        Execute a generic OLAP query and return a DataFrame.
+
+        Behaviour
+        ---------
+        * Query backend fresh for each execution (no caching of aggregated results).
+          This ensures row counts update correctly as dimensions are added/removed
+          during drill-down interactions.
+        * If rows and columns are both empty  → return the flat table
+          (optionally filtered and metric-projected).
+        * If rows is non-empty and columns is empty → GROUP BY rows,
+          aggregate metrics.
+        * If both rows and columns are non-empty → GROUP BY rows,
+          aggregate metrics, then pivot on columns.
+        * filters are applied before aggregation.
+        """
+        LOGGER.debug(
+            "Spark execute: rows=%s columns=%s metrics=%s filters=%s",
+            request.rows,
+            request.columns,
+            request.metrics,
+            list((request.filters or {}).keys()),
+        )
+        df = self.flat_table().copy()
+
+        # 1. Apply filters
+        for attr, allowed in (request.filters or {}).items():
+            if attr in df.columns and allowed:
+                df = df[df[attr].isin(allowed)]
+
+        # 2. Resolve metrics
+        all_metric_names = [m.name for m in self._model.metrics]
+        metrics = request.metrics if request.metrics else all_metric_names
+        metrics = [m for m in metrics if m in df.columns]
+
+        # 3. No grouping → return full flat table (all columns, already filtered)
+        if not request.rows and not request.columns:
+            return df
+
+        # 4. Group-by aggregation
+        group_cols = list(dict.fromkeys(request.rows + request.columns))
+        group_cols = [c for c in group_cols if c in df.columns]
+
+        agg_map = {
+            m.name: m.default_agg
+            for m in self._model.metrics
+            if m.name in metrics
+        }
+        # pandas named-agg via dict: {metric: (metric, agg_func)}
+        agg_kwargs = {m: (m, func) for m, func in agg_map.items()}
+        df = df.groupby(group_cols, as_index=False).agg(**agg_kwargs)
+
+        # 5. Pivot (optional)
+        if request.rows and request.columns:
+            df = df.pivot_table(
+                index=request.rows,
+                columns=request.columns,
+                values=metrics,
+                aggfunc="sum",
+            ).reset_index()
+            # Flatten multi-level column names
+            df.columns = [
+                "_".join(str(part) for part in col).strip("_") if isinstance(col, tuple) else col
+                for col in df.columns
+            ]
+
+        LOGGER.debug("Spark execute result shape=%s", df.shape)
+        return df
+
+    # -- Private helpers -----------------------------------------------------
+
+    def _build_flat_table(self) -> pd.DataFrame:
+        """Join fact + dimensions from Databricks tables and return pandas DataFrame."""
+
+        fact_name = self._qualified_table_name(self._model.fact)
+        LOGGER.info("Reading fact table from Spark: %s", fact_name)
+        fact = self._spark.table(fact_name)
+
+        df = fact
+        for dim in self._model.dimensions:
+            dim_name = self._qualified_table_name(dim)
+            LOGGER.info("Joining dimension table from Spark: %s", dim_name)
+            dim_cols = [dim.dim_key] + [a.name for a in dim.attributes]
+            dim_df = self._spark.table(dim_name).select(*dim_cols)
+
+            dim_join_key = f"__{dim.name.lower().replace(' ', '_')}_dim_key"
+            dim_df = dim_df.withColumnRenamed(dim.dim_key, dim_join_key)
+
+            df = df.join(dim_df, on=(df[dim.fact_key] == dim_df[dim_join_key]), how="left")
+            df = df.drop(dim_join_key)
+
+            # Add synthetic display key alias (copy of fact foreign key)
+            df = df.withColumn(dim.display_key, df[dim.fact_key])
+
+        return df.toPandas()
+
+    def _qualified_table_name(self, table_def) -> str:
+        parts = [
+            getattr(table_def, "catalog", None) or self._config.default_catalog,
+            getattr(table_def, "schema", None) or self._config.default_schema,
+            table_def.table,
+        ]
+        return ".".join([p for p in parts if p])
+
+    @staticmethod
+    def _get_spark_session():
+        try:
+            spark_mod = importlib.import_module("pyspark.sql")
+            SparkSession = getattr(spark_mod, "SparkSession")
+        except Exception as ex:
+            raise RuntimeError(
+                "pyspark is not available. This backend must run inside Databricks workspace."
+            ) from ex
+
+        spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+        if spark is None:
+            raise RuntimeError("No active Spark session found in current runtime.")
+        return spark
+
+
+class DatabricksSqlBackend:
+    """
+    Databricks SQL Warehouse backend using `databricks-sql-connector`.
+    """
+
+    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
+        self._model = model
+        self._config = config or load_databricks_config_from_env()
+        self._flat: pd.DataFrame | None = None
+        self._validate_config()
+        LOGGER.info("Initialized SQL backend for model=%s", self._model.name)
+
+    def flat_table(self) -> pd.DataFrame:
+        if self._flat is None:
+            LOGGER.info("Building SQL flat table for model=%s", self._model.name)
+            self._flat = self._build_flat_table()
+            LOGGER.info("SQL flat table built: shape=%s", self._flat.shape)
+        return self._flat
+
+    def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
+        """
+        Execute a generic OLAP query and return a DataFrame.
+        
+        Query backend fresh for each execution (bypasses flat_table cache).
+        This ensures row counts update correctly as dimensions are added/removed
+        during drill-down interactions.
+        """
+        LOGGER.debug(
+            "SQL execute: rows=%s columns=%s metrics=%s filters=%s",
+            request.rows,
+            request.columns,
+            request.metrics,
+            list((request.filters or {}).keys()),
+        )
+        # Build SQL query with only requested dimensions (bypasses flat_table cache)
+        sql = self._build_flat_sql(request)
+        LOGGER.info("Executing SQL query:\n%s", sql)
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+        except Exception as ex:
+            LOGGER.error("SQL query failed:\n%s", sql, exc_info=True)
+            raise RuntimeError("Failed to execute SQL query. See logs for details.") from ex
+        finally:
+            conn.close()
+
+        for attr, allowed in (request.filters or {}).items():
+            if attr in df.columns and allowed:
+                df = df[df[attr].isin(allowed)]
+
+        all_metric_names = [m.name for m in self._model.metrics]
+        metrics = request.metrics if request.metrics else all_metric_names
+        metrics = [m for m in metrics if m in df.columns]
+
+        if not request.rows and not request.columns:
+            return df
+
+        group_cols = list(dict.fromkeys(request.rows + request.columns))
+        group_cols = [c for c in group_cols if c in df.columns]
+
+        agg_map = {m.name: m.default_agg for m in self._model.metrics if m.name in metrics}
+        agg_kwargs = {m: (m, func) for m, func in agg_map.items()}
+        
+        #df = df.groupby(group_cols, as_index=False).agg(**agg_kwargs)
+
+        if request.rows and request.columns:
+            df = df.pivot_table(
+                index=request.rows,
+                columns=request.columns,
+                values=metrics,
+                aggfunc="sum",
+            ).reset_index()
+            df.columns = [
+                "_".join(str(part) for part in col).strip("_") if isinstance(col, tuple) else col
+                for col in df.columns
+            ]
+
+        LOGGER.debug("SQL execute result shape=%s", df.shape)
+        return df
+
+    def _validate_config(self) -> None:
+        missing = []
+        if not self._config.server_hostname:
+            missing.append("DATABRICKS_SERVER_HOSTNAME")
+        if not self._config.http_path:
+            missing.append("DATABRICKS_HTTP_PATH")
+        if not self._config.access_token:
+            missing.append("DATABRICKS_TOKEN")
+        if missing:
+            LOGGER.error("SQL backend config missing env vars: %s", ", ".join(missing))
+            raise RuntimeError(
+                "Databricks SQL backend missing required env vars: " + ", ".join(missing)
+            )
+
+    def _build_flat_table(self) -> pd.DataFrame:
+        sql = self._build_flat_sql(request=None)  # request=None → include all dimensions
+        LOGGER.debug("Executing SQL query:\n%s", sql)
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(rows, columns=cols)
+        except Exception as ex:
+            LOGGER.error("SQL query failed:\n%s", sql, exc_info=True)
+            raise RuntimeError("Failed to execute SQL query. See logs for details.") from ex
+        finally:
+            conn.close()
+
+    def _build_flat_sql(self, request: OlapQueryRequest | None = None) -> str:
         """
         Build SQL query with only requested dimensions and metrics.
         
@@ -176,10 +429,12 @@ class OlapSqlBuilder:
 
         # Only include dimensions whose attributes are requested
         dim_idx = 0
+
+
         for dim in self._model.dimensions:
             # Check if any attribute from this dimension is requested
             dim_attrs_to_include = []
-            dim_key_include = False            
+            dim_key_include = False
             
             if include_all_dims:
                 # Include all attributes (flat table or no drilldown yet)
@@ -195,17 +450,21 @@ class OlapSqlBuilder:
                     f"{display_key_expr} AS {self._q(dim.dim_key)}"
                 )
                 group_by_cols.append(display_key_expr)      
-                dim_key_include = True  # Flag to indicate we need to join this dimension
+                dim_key_include = True      
 
             # Only join dimension if it has attributes to include
-            if not dim_attrs_to_include and not dim_key_include:
+            if not dim_attrs_to_include and dim_key_include is False:
                 continue
             
             dim_idx += 1
             d_alias = f"d{dim_idx}"
             join_sql.append(
-                f"LEFT JOIN {self._qualified_table_name(dim)} {d_alias} "
-                f"ON {fact_alias}.{self._q(dim.fact_key)} = {d_alias}.{self._q(dim.dim_key)}"
+                " ".join(
+                    [
+                        f"LEFT JOIN {self._qualified_table_name(dim)} {d_alias}",
+                        f"ON {fact_alias}.{self._q(dim.fact_key)} = {d_alias}.{self._q(dim.dim_key)}",
+                    ]
+                )
             )
 
             # Include only requested attributes
@@ -221,7 +480,6 @@ class OlapSqlBuilder:
                 select_cols.append(
                     f"SUM({fact_alias}.{self._q(metric.name)}) AS {self._q(metric.name)}"
                 )
-
         group_by_cols.append("'1'")  # dummy group by to allow aggregation without dimensions
 
         return "\n".join(
@@ -249,179 +507,6 @@ class OlapSqlBuilder:
     @staticmethod
     def _q(name: str) -> str:
         return f"`{name}`"
-
-
-# ---------------------------------------------------------------------------
-# Databricks Spark Backend
-# ---------------------------------------------------------------------------
-
-class DatabricksSparkBackend:
-    """
-    Implements OlapDatabase using tables available in the Databricks workspace
-    where the app is running.
-
-    It reads model table metadata (catalog/schema/table), loads Spark tables,
-    joins them, and returns pandas DataFrames to the frontend.
-    """
-
-    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
-        self._model = model
-        self._config = config or load_databricks_config_from_env()
-        self._sql_builder = OlapSqlBuilder(model, self._config)
-        self._flat: pd.DataFrame | None = None  # lazy cache
-        self._spark = self._get_spark_session()
-        LOGGER.info("Initialized Spark backend for model=%s", self._model.name)
-
-    # -- Public interface ----------------------------------------------------
-
-    def flat_table(self) -> pd.DataFrame:
-        raise ValueError("flat_table() is deprecated!!!")
-        """
-        Return the fully joined flat table with synthetic display keys added.
-        Result is cached — Spark join is executed once per process.
-        """
-        if self._flat is None:
-            LOGGER.info("Building Spark flat table for model=%s", self._model.name)
-            self._flat = self._build_flat_table()
-            LOGGER.info("Spark flat table built: shape=%s", self._flat.shape)
-        return self._flat
-
-    def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
-        """
-        Execute OLAP query via Spark SQL.
-
-        Queries the backend fresh for each execution (no caching of aggregated results).
-        This ensures row counts update correctly as dimensions are added/removed
-        during drill-down interactions.
-        """
-        LOGGER.debug(
-            "Spark execute: rows=%s columns=%s metrics=%s filters=%s",
-            request.rows,
-            request.columns,
-            request.metrics,
-            list((request.filters or {}).keys()),
-        )
-        # Build and execute SQL via Spark
-        sql = self._sql_builder.build_sql(request)
-        LOGGER.debug("Executing Spark SQL:\n%s", sql)
-        df = self._spark.sql(sql).toPandas()
-
-        # Apply filters post-query
-        for attr, allowed in (request.filters or {}).items():
-            if attr in df.columns and allowed:
-                df = df[df[attr].isin(allowed)]
-
-        LOGGER.debug("Spark execute result shape=%s", df.shape)
-        return df
-
-    # -- Private helpers -----------------------------------------------------
-
-    def _build_flat_table(self) -> pd.DataFrame:
-        raise ValueError("flat_table() is deprecated!!!")
-        """Join fact + dimensions from Databricks tables and return pandas DataFrame."""
-
-        fact_name = self._qualified_table_name(self._model.fact)
-        LOGGER.info("Reading fact table from Spark: %s", fact_name)
-        fact = self._spark.table(fact_name)
-
-        df = fact
-        for dim in self._model.dimensions:
-            dim_name = self._sql_builder._qualified_table_name(dim)
-            LOGGER.info("Joining dimension table from Spark: %s", dim_name)
-            dim_cols = [dim.dim_key] + [a.name for a in dim.attributes]
-            dim_df = self._spark.table(dim_name).select(*dim_cols)
-
-            dim_join_key = f"__{dim.name.lower().replace(' ', '_')}_dim_key"
-            dim_df = dim_df.withColumnRenamed(dim.dim_key, dim_join_key)
-
-            df = df.join(dim_df, on=(df[dim.fact_key] == dim_df[dim_join_key]), how="left")
-            df = df.drop(dim_join_key)
-
-            # Add synthetic display key alias (copy of fact foreign key)
-            df = df.withColumn(dim.display_key, df[dim.fact_key])
-
-        return df.toPandas()
-
-    @staticmethod
-    def _get_spark_session():
-        try:
-            spark_mod = importlib.import_module("pyspark.sql")
-            SparkSession = getattr(spark_mod, "SparkSession")
-        except Exception as ex:
-            raise RuntimeError(
-                "pyspark is not available. This backend must run inside Databricks workspace."
-            ) from ex
-
-        spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
-        if spark is None:
-            raise RuntimeError("No active Spark session found in current runtime.")
-        return spark
-
-
-class DatabricksSqlBackend:
-    """
-    Databricks SQL Warehouse backend using `databricks-sql-connector`.
-    """
-    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
-        self._model = model
-        self._config = config or load_databricks_config_from_env()
-        self._sql_builder = OlapSqlBuilder(model, self._config)
-        self._flat: pd.DataFrame | None = None
-        self._validate_config()
-        LOGGER.info("Initialized SQL backend for model=%s", self._model.name)
-
-    def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
-        """
-        Execute OLAP query via SQL connector.
-        
-        Query backend fresh for each execution (bypasses flat_table cache).
-        This ensures row counts update correctly as dimensions are added/removed
-        during drill-down interactions.
-        """
-        LOGGER.debug(
-            "SQL execute: rows=%s columns=%s metrics=%s filters=%s",
-            request.rows,
-            request.columns,
-            request.metrics,
-            list((request.filters or {}).keys()),
-        )
-        # Build SQL query using shared builder
-        sql = self._sql_builder.build_sql(request)
-        LOGGER.debug("Executing SQL query:\n%s", sql)
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-            df = pd.DataFrame(rows, columns=cols)
-        except Exception as ex:
-            LOGGER.error("SQL query failed:\n%s", sql, exc_info=True)
-            raise RuntimeError("Failed to execute SQL query. See logs for details.") from ex
-        finally:
-            conn.close()
-
-        # Apply filters post-query
-        for attr, allowed in (request.filters or {}).items():
-            if attr in df.columns and allowed:
-                df = df[df[attr].isin(allowed)]
-
-        LOGGER.debug("SQL execute result shape=%s", df.shape)
-        return df
-
-    def _validate_config(self) -> None:
-        missing = []
-        if not self._config.server_hostname:
-            missing.append("DATABRICKS_SERVER_HOSTNAME")
-        if not self._config.http_path:
-            missing.append("DATABRICKS_HTTP_PATH")
-        if not self._config.access_token:
-            missing.append("DATABRICKS_TOKEN")
-        if missing:
-            LOGGER.error("SQL backend config missing env vars: %s", ", ".join(missing))
-            raise RuntimeError(
-                "Databricks SQL backend missing required env vars: " + ", ".join(missing)
-            )
 
     def _connect(self):
         try:
