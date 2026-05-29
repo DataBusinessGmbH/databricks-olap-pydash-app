@@ -8,8 +8,9 @@ model_name: Sales Model
 
 fact:
   name: fact_sales
-  # source is used by the CSV backend; a real backend would use table/schema
-  source: data/sales/fact_sales.csv
+  catalog: testdata
+  schema: gold
+  table: fact_sales
   # surrogate keys used only for joins — hidden in the UI
   join_keys:
     - date_key
@@ -29,8 +30,9 @@ fact:
 
 dimensions:
   - name: Date
+    catalog: testdata
+    schema: gold
     table: dim_date
-    source: data/sales/dim_date.csv
     # Column in the fact table that references this dimension
     fact_key: date_key
     # Column in the dimension table that is the primary key
@@ -49,8 +51,9 @@ dimensions:
         type: integer
 
   - name: Product
+    catalog: testdata
+    schema: gold
     table: dim_product
-    source: data/sales/dim_product.csv
     fact_key: product_key
     dim_key: product_key
     display_key: product_dim_key
@@ -66,8 +69,9 @@ dimensions:
         type: string
 
   - name: Customer
+    catalog: testdata
+    schema: gold
     table: dim_customer
-    source: data/sales/dim_customer.csv
     fact_key: customer_key
     dim_key: customer_key
     display_key: customer_dim_key

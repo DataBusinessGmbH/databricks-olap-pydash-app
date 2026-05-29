@@ -42,8 +42,9 @@ class MetricDef:
 class DimensionDef:
     """One dimension table and its relationship to the fact table."""
     name: str           # Human-readable name, e.g. "Date"
+    catalog: str | None # Optional catalog (Databricks)
+    schema: str | None  # Optional schema (Databricks)
     table: str          # Physical table name
-    source: str         # Path hint used by CSV backend (relative to model file)
     fact_key: str       # FK column on the fact table
     dim_key: str        # PK column on the dimension table
     display_key: str    # Synthetic alias shown in the UI (Key column)
@@ -59,7 +60,9 @@ class DimensionDef:
 class FactDef:
     """The fact table definition."""
     name: str
-    source: str
+    catalog: str | None
+    schema: str | None
+    table: str
     join_keys: list[str]    # Surrogate keys used for joins only (hidden in UI)
     metrics: list[MetricDef] = field(default_factory=list)
 
@@ -103,7 +106,9 @@ class OlapModel:
         rf = raw["fact"]
         fact = FactDef(
             name=rf["name"],
-            source=rf["source"],
+            catalog=rf.get("catalog"),
+            schema=rf.get("schema"),
+            table=rf["table"],
             join_keys=rf.get("join_keys", []),
             metrics=[
                 MetricDef(
@@ -121,8 +126,9 @@ class OlapModel:
         dimensions = [
             DimensionDef(
                 name=d["name"],
+                catalog=d.get("catalog"),
+                schema=d.get("schema"),
                 table=d["table"],
-                source=d["source"],
                 fact_key=d["fact_key"],
                 dim_key=d["dim_key"],
                 display_key=d["display_key"],

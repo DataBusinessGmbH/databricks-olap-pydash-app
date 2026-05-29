@@ -15,3 +15,5 @@ venv/
 # OS/editor
 .DS_Store
 .vscode/
+
+.env

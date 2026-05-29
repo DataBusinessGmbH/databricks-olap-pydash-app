@@ -8,17 +8,20 @@ This file contains ONLY UI concerns:
 
 No knowledge of CSV paths, join keys, or metric names lives here.
 To point at a different backend (Databricks, Snowflake, …) swap the
-CsvBackend instantiation for another OlapDatabase implementation.
+DatabricksBackend instantiation for another OlapDatabase implementation.
 """
 
 from pathlib import Path
+import os
 
 import dash_ag_grid as dag
 import pandas as pd
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, dcc, html, no_update
+import dash
 
 from src.model import OlapModel, DimensionDef, MetricDef
-from src.db import CsvBackend, OlapQueryRequest
+from src.db import OlapDatabase, OlapQueryRequest, create_databricks_backend
+import logging
 
 # ---------------------------------------------------------------------------
 # Bootstrap: load model, connect database layer
@@ -26,6 +29,29 @@ from src.db import CsvBackend, OlapQueryRequest
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
+
+
+def load_env_on_startup() -> None:
+    """
+    Load environment variables from .env automatically.
+
+    - If .env exists, load it without overriding already-exported environment vars.
+    - If .env does not exist, default backend mode to spark.
+    """
+    env_path = BASE_DIR / ".env"
+
+    if env_path.exists():
+        try:
+            dotenv = __import__("dotenv")
+            dotenv.load_dotenv(dotenv_path=env_path, override=False)
+        except Exception:
+            # If python-dotenv is unavailable, continue with existing process env.
+            pass
+
+    os.environ.setdefault("DATABRICKS_BACKEND_MODE", "spark")
+
+
+load_env_on_startup()
 
 
 def discover_model_files() -> dict[str, Path]:
@@ -47,7 +73,7 @@ def discover_model_files() -> dict[str, Path]:
 MODEL_FILES = discover_model_files()
 DEFAULT_MODEL_ID = next(iter(MODEL_FILES.keys()))
 MODEL_CACHE: dict[str, OlapModel] = {}
-DB_CACHE: dict[str, CsvBackend] = {}
+DB_CACHE: dict[str, OlapDatabase] = {}
 
 
 def get_model(model_id: str) -> OlapModel:
@@ -56,9 +82,9 @@ def get_model(model_id: str) -> OlapModel:
     return MODEL_CACHE[model_id]
 
 
-def get_backend(model_id: str) -> CsvBackend:
+def get_backend(model_id: str) -> OlapDatabase:
     if model_id not in DB_CACHE:
-        DB_CACHE[model_id] = CsvBackend(get_model(model_id), base_dir=BASE_DIR)
+        DB_CACHE[model_id] = create_databricks_backend(get_model(model_id))
     return DB_CACHE[model_id]
 
 
@@ -141,11 +167,11 @@ def build_column_defs(df: pd.DataFrame, model: OlapModel) -> list[dict]:
     # Dimension groups
     for dim in model.dimensions:
         children: list[dict] = []
-        if dim.display_key in df.columns:
-            children.append(_dim_field_def(dim.display_key, dim))
+        if dim.display_key in df.columns or 1==1:
+            children.append(_dim_field_def(dim.dim_key, dim))
             known_fields.add(dim.display_key)
         for attr in dim.attributes:
-            if attr.name in df.columns:
+            if attr.name in df.columns or 1==1:
                 children.append(_dim_field_def(attr.name, dim))
                 known_fields.add(attr.name)
         if children:
@@ -273,6 +299,63 @@ def on_model_change(model_id: str):
     selected_model = get_model(model_id)
     selected_df = get_flat_table(model_id)
     return selected_df.to_dict("records"), build_column_defs(selected_df, selected_model)
+
+
+@app.callback(
+    Output("olap-grid", "rowData", allow_duplicate=True),
+    Input("olap-grid", "columnState"),
+    Input("model-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_grid_dimension_change(column_state, model_id: str):
+    """
+    Triggered when user drags/drops dimensions to row group or pivot areas.
+    
+    Extracts row groups and pivot columns from AG Grid column state,
+    then queries the backend with the new dimensions to ensure accurate
+    aggregations based on the current drill-down configuration.
+    """
+    logger = logging.getLogger(__name__)
+
+    # Then in the placeholder:
+    logger.info(f"Dimensions changed for model {model_id}")    
+    #logger.info(f"Column state: {column_state}")
+
+    if not column_state:
+        return no_update
+    
+    # Extract row group columns and pivot columns from column state
+    row_groups = []
+    pivot_cols = []
+    
+    for col_state in column_state:
+        if col_state.get("hide"):
+            continue  # Skip hidden columns
+        if col_state.get("rowGroup"):
+            row_groups.append(col_state["colId"])
+            continue
+        if col_state.get("pivot"):
+            pivot_cols.append(col_state["colId"])
+            continue
+        row_groups.append(col_state["colId"])
+
+    logger.info(f"Row groups: {row_groups}")
+    logger.info(f"Pivot columns: {pivot_cols}")
+
+    # Query backend with the new dimensions
+    request = OlapQueryRequest(
+        rows=row_groups,
+        columns=pivot_cols,
+        metrics=[],  # empty → use all metrics
+        filters={},
+    )
+    
+    selected_model = get_model(model_id)
+    backend = get_backend(model_id)
+    result_df = backend.execute(request)
+    
+    return result_df.to_dict("records")
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=8050)

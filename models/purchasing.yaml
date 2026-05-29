@@ -2,7 +2,9 @@ model_name: Purchasing Model
 
 fact:
   name: fact_purchases
-  source: data/purchasing/fact_purchases.csv
+  catalog: testdata
+  schema: gold
+  table: fact_purchases
   join_keys:
     - date_key
     - product_key
@@ -32,8 +34,9 @@ fact:
 
 dimensions:
   - name: Date
+    catalog: testdata
+    schema: gold
     table: dim_purchase_date
-    source: data/purchasing/dim_purchase_date.csv
     fact_key: date_key
     dim_key: date_key
     display_key: date_dim_key
@@ -49,14 +52,15 @@ dimensions:
         type: integer
 
   - name: Product
+    catalog: testdata
+    schema: gold
     table: dim_purchase_product
-    source: data/purchasing/dim_purchase_product.csv
     fact_key: product_key
     dim_key: product_key
     display_key: product_dim_key
     attributes:
-      - name: sku
-        label: SKU
+      - name: brand
+        label: Brand
         type: string
       - name: product_name
         label: Product Name
@@ -66,8 +70,9 @@ dimensions:
         type: string
 
   - name: Supplier
+    catalog: testdata
+    schema: gold
     table: dim_supplier
-    source: data/purchasing/dim_supplier.csv
     fact_key: supplier_key
     dim_key: supplier_key
     display_key: supplier_dim_key
@@ -78,13 +83,14 @@ dimensions:
       - name: supplier_region
         label: Supplier Region
         type: string
-      - name: payment_terms
-        label: Payment Terms
+      - name: supplier_tier
+        label: Tier
         type: string
 
   - name: Buyer
+    catalog: testdata
+    schema: gold
     table: dim_buyer
-    source: data/purchasing/dim_buyer.csv
     fact_key: buyer_key
     dim_key: buyer_key
     display_key: buyer_dim_key
@@ -95,6 +101,6 @@ dimensions:
       - name: department
         label: Department
         type: string
-      - name: location
+      - name: buyer_region
         label: Location
         type: string
