@@ -34,6 +34,7 @@ import importlib
 import logging
 import os
 from typing import Protocol
+from pyspark.sql import SparkSession
 
 import pandas as pd
 
