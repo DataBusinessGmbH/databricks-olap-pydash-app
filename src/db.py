@@ -103,6 +103,10 @@ class OlapDatabase(Protocol):
         """Return the current backend user, or a safe fallback."""
         ...
 
+    def filter_values(self, field_name: str, max_values: int = 500) -> list:
+        """Return distinct non-null values for a filterable field."""
+        ...
+
 
 @dataclass
 class DatabricksConnectionConfig:
@@ -162,6 +166,7 @@ class OlapSqlBuilder:
         fact_alias = "f"
         select_cols: list[str] = []
         group_by_cols: list[str] = []
+        where_clauses: list[str] = []
         join_sql = []
 
         # Determine which dimension attributes are needed
@@ -169,6 +174,8 @@ class OlapSqlBuilder:
         if request:
             requested_cols.update(request.rows)
             requested_cols.update(request.columns)
+
+        filter_fields = set((request.filters or {}).keys()) if request else set()
 
         # If request is None or both rows/columns are empty, include all dimensions (flat table state)
         include_all_dims = request is None or (not request.rows and not request.columns)
@@ -186,6 +193,8 @@ class OlapSqlBuilder:
             # Check if any attribute from this dimension is requested
             dim_attrs_to_include = []
             dim_key_include = False            
+            attr_names = {a.name for a in dim.attributes}
+            dim_filter_attr_names = [a for a in attr_names if a in filter_fields]
             
             if include_all_dims:
                 # Include all attributes (flat table or no drilldown yet)
@@ -203,8 +212,19 @@ class OlapSqlBuilder:
                 group_by_cols.append(display_key_expr)      
                 dim_key_include = True  # Flag to indicate we need to join this dimension
 
+            # key filters on dim key/display key are applied against fact foreign key
+            if request and request.filters:
+                for key_field in (dim.dim_key, dim.display_key):
+                    if key_field in request.filters and request.filters[key_field]:
+                        where_sql = self._in_filter_sql(
+                            f"{fact_alias}.{self._q(dim.fact_key)}",
+                            request.filters[key_field],
+                        )
+                        if where_sql:
+                            where_clauses.append(where_sql)
+
             # Only join dimension if it has attributes to include
-            if not dim_attrs_to_include and not dim_key_include:
+            if not dim_attrs_to_include and not dim_key_include and not dim_filter_attr_names:
                 continue
             
             dim_idx += 1
@@ -219,6 +239,27 @@ class OlapSqlBuilder:
                 attr_expr = f"{d_alias}.{self._q(attr_name)}"
                 select_cols.append(f"{attr_expr} AS {self._q(attr_name)}")
                 group_by_cols.append(attr_expr)
+
+            # filters on dimension attributes
+            if request and request.filters:
+                for attr_name in dim_filter_attr_names:
+                    where_sql = self._in_filter_sql(
+                        f"{d_alias}.{self._q(attr_name)}",
+                        request.filters[attr_name],
+                    )
+                    if where_sql:
+                        where_clauses.append(where_sql)
+
+        # filters on fact join keys
+        if request and request.filters:
+            for key in self._model.fact.join_keys:
+                if key in request.filters and request.filters[key]:
+                    where_sql = self._in_filter_sql(
+                        f"{fact_alias}.{self._q(key)}",
+                        request.filters[key],
+                    )
+                    if where_sql:
+                        where_clauses.append(where_sql)
 
         # Include only requested metrics (or all if request is None)
         requested_metrics = set(request.metrics) if request else set()
@@ -235,6 +276,14 @@ class OlapSqlBuilder:
             *join_sql,
         ]
 
+        if where_clauses:
+            sql_parts.extend(
+                [
+                    "WHERE",
+                    "  " + "\n  AND ".join(where_clauses),
+                ]
+            )
+
         if group_by_cols:
             sql_parts.extend(
                 [
@@ -248,6 +297,68 @@ class OlapSqlBuilder:
             sql_parts.append(f"LIMIT {max_rows}")
 
         return "\n".join(sql_parts)
+
+    def build_distinct_values_sql(self, field_name: str, max_values: int = 500) -> str:
+        """
+        Build SQL to fetch distinct non-null values for one filter field.
+
+        Supported fields:
+        - Dimension attributes: distinct values via fact left join dimension.
+        - Dimension dim_key/display_key: distinct fact foreign key aliased as field.
+        - Fact join keys: distinct values from fact.
+        """
+        fact_alias = "f"
+        max_vals = max_values if isinstance(max_values, int) and max_values > 0 else 500
+        fact_table = self._qualified_table_name(self._model.fact)
+
+        for dim in self._model.dimensions:
+            attr_names = {a.name for a in dim.attributes}
+
+            if field_name in attr_names:
+                dim_alias = "d"
+                attr_expr = f"{dim_alias}.{self._q(field_name)}"
+                return "\n".join(
+                    [
+                        "SELECT DISTINCT",
+                        f"  {attr_expr} AS {self._q(field_name)}",
+                        f"FROM {fact_table} {fact_alias}",
+                        (
+                            f"LEFT JOIN {self._qualified_table_name(dim)} {dim_alias} "
+                            f"ON {fact_alias}.{self._q(dim.fact_key)} = {dim_alias}.{self._q(dim.dim_key)}"
+                        ),
+                        f"WHERE {attr_expr} IS NOT NULL",
+                        "ORDER BY 1",
+                        f"LIMIT {max_vals}",
+                    ]
+                )
+
+            if field_name == dim.dim_key or field_name == dim.display_key:
+                fk_expr = f"{fact_alias}.{self._q(dim.fact_key)}"
+                return "\n".join(
+                    [
+                        "SELECT DISTINCT",
+                        f"  {fk_expr} AS {self._q(field_name)}",
+                        f"FROM {fact_table} {fact_alias}",
+                        f"WHERE {fk_expr} IS NOT NULL",
+                        "ORDER BY 1",
+                        f"LIMIT {max_vals}",
+                    ]
+                )
+
+        if field_name in self._model.fact.join_keys:
+            key_expr = f"{fact_alias}.{self._q(field_name)}"
+            return "\n".join(
+                [
+                    "SELECT DISTINCT",
+                    f"  {key_expr} AS {self._q(field_name)}",
+                    f"FROM {fact_table} {fact_alias}",
+                    f"WHERE {key_expr} IS NOT NULL",
+                    "ORDER BY 1",
+                    f"LIMIT {max_vals}",
+                ]
+            )
+
+        raise ValueError(f"Unsupported field for filter values: {field_name}")
 
     def _qualified_table_name(self, table_def) -> str:
         parts = [
@@ -275,6 +386,22 @@ class OlapSqlBuilder:
             return None
 
         return max_rows if max_rows > 0 else None
+
+    @staticmethod
+    def _sql_literal(value) -> str | None:
+        if value is None:
+            return None
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'"
+
+    @classmethod
+    def _in_filter_sql(cls, expr: str, allowed_values: list) -> str | None:
+        literals = [cls._sql_literal(v) for v in (allowed_values or [])]
+        literals = [v for v in literals if v is not None]
+        if not literals:
+            return None
+        # Compare as strings to match AG Grid filter model values consistently
+        return f"CAST({expr} AS STRING) IN ({', '.join(literals)})"
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +459,6 @@ class DatabricksSparkBackend:
         LOGGER.debug("Executing Spark SQL:\n%s", sql)
         df = self._spark.sql(sql).toPandas()
 
-        # Apply filters post-query
-        for attr, allowed in (request.filters or {}).items():
-            if attr in df.columns and allowed:
-                df = df[df[attr].isin(allowed)]
-
         LOGGER.debug("Spark execute result shape=%s", df.shape)
         return df
 
@@ -348,6 +470,13 @@ class DatabricksSparkBackend:
         except Exception:
             LOGGER.warning("Failed to resolve Spark current user", exc_info=True)
         return "Unknown user"
+
+    def filter_values(self, field_name: str, max_values: int = 500) -> list:
+        sql = self._sql_builder.build_distinct_values_sql(field_name, max_values)
+        values_df = self._spark.sql(sql).toPandas()
+        if values_df.empty:
+            return []
+        return [v for v in values_df.iloc[:, 0].tolist() if pd.notna(v)]
 
     # -- Private helpers -----------------------------------------------------
 
@@ -427,7 +556,7 @@ class DatabricksSqlBackend:
         )
         # Build SQL query using shared builder
         sql = self._sql_builder.build_sql(request)
-        LOGGER.debug("Executing SQL query:\n%s", sql)
+        #LOGGER.info("Executing SQL query:\n%s", sql)
         conn = self._connect()
         try:
             cur = conn.cursor()
@@ -440,11 +569,6 @@ class DatabricksSqlBackend:
             raise RuntimeError("Failed to execute SQL query. See logs for details.") from ex
         finally:
             conn.close()
-
-        # Apply filters post-query
-        for attr, allowed in (request.filters or {}).items():
-            if attr in df.columns and allowed:
-                df = df[df[attr].isin(allowed)]
 
         LOGGER.debug("SQL execute result shape=%s", df.shape)
         return df
@@ -464,6 +588,21 @@ class DatabricksSqlBackend:
             if conn is not None:
                 conn.close()
         return "Unknown user"
+
+    def filter_values(self, field_name: str, max_values: int = 500) -> list:
+        sql = self._sql_builder.build_distinct_values_sql(field_name, max_values)
+        LOGGER.info("Executing SQL query:\n%s", sql)
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            return [row[0] for row in rows if row and pd.notna(row[0])]
+        except Exception as ex:
+            LOGGER.error("SQL filter-values query failed:\n%s", sql, exc_info=True)
+            raise RuntimeError("Failed to fetch filter values. See logs for details.") from ex
+        finally:
+            conn.close()
 
     def _validate_config(self) -> None:
         missing = []

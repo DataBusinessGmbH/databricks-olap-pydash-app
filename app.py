@@ -110,6 +110,28 @@ def get_logged_in_user(model_id: str) -> str:
     return get_backend(model_id).current_user()
 
 
+def get_filter_values_map(model_id: str, max_values: int = 500) -> dict[str, list]:
+    model = get_model(model_id)
+    backend = get_backend(model_id)
+    values_map: dict[str, list] = {}
+
+    for dim in model.dimensions:
+        fields = [dim.dim_key] + [a.name for a in dim.attributes]
+        for field_name in fields:
+            try:
+                values_map[field_name] = backend.filter_values(field_name, max_values=max_values)
+            except Exception:
+                LOGGER.warning(
+                    "Failed to fetch filter values for model=%s field=%s",
+                    model_id,
+                    field_name,
+                    exc_info=True,
+                )
+                values_map[field_name] = []
+
+    return values_map
+
+
 def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequest:
     max_rows = sanitize_max_rows(max_rows_value)
 
@@ -139,6 +161,27 @@ def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequ
     )
 
 
+def build_filters_from_filter_model(filter_model) -> dict[str, list]:
+    filters: dict[str, list] = {}
+    if not filter_model:
+        return filters
+
+    for field_name, cfg in filter_model.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        values = cfg.get("values")
+        if isinstance(values, list) and values:
+            filters[field_name] = values
+            continue
+
+        single = cfg.get("filter")
+        if single not in (None, ""):
+            filters[field_name] = [single]
+
+    return filters
+
+
 def get_model_dropdown_options() -> list[dict[str, str]]:
     options: list[dict[str, str]] = []
     for model_id in MODEL_FILES.keys():
@@ -154,7 +197,7 @@ def _label(name: str) -> str:
     return name.replace("_", " ").title()
 
 
-def _dim_field_def(col_name: str, dim: DimensionDef) -> dict:
+def _dim_field_def(col_name: str, dim: DimensionDef, filter_values: list | None = None) -> dict:
     """Build an AG Grid column def for a dimension attribute or display key."""
     is_display_key = col_name == dim.display_key
 
@@ -163,16 +206,21 @@ def _dim_field_def(col_name: str, dim: DimensionDef) -> dict:
         _label(col_name),
     )
 
-    return {
+    col_def = {
         "field": col_name,
         "headerName": label,
         "sortable": True,
-        "filter": True,
+        "filter": "agSetColumnFilter",
         "resizable": True,
         "hide": is_display_key,
         "enablePivot": True,
         "enableRowGroup": True,
     }
+
+    if filter_values is not None:
+        col_def["filterParams"] = {"values": filter_values}
+
+    return col_def
 
 
 def _metric_field_def(metric: MetricDef) -> dict:
@@ -202,23 +250,28 @@ def _join_key_field_def(key: str) -> dict:
     }
 
 
-def build_column_defs(df: pd.DataFrame, model: OlapModel) -> list[dict]:
+def build_column_defs(
+    df: pd.DataFrame,
+    model: OlapModel,
+    filter_values_map: dict[str, list] | None = None,
+) -> list[dict]:
     """
     Build the full grouped column-def tree for AG Grid.
     Groups: one per dimension + Metrics. Surrogate keys are hidden leaves.
     """
     defs: list[dict] = []
     known_fields: set[str] = set()
+    values_map = filter_values_map or {}
 
     # Dimension groups
     for dim in model.dimensions:
         children: list[dict] = []
         if dim.display_key in df.columns or 1==1:
-            children.append(_dim_field_def(dim.dim_key, dim))
+            children.append(_dim_field_def(dim.dim_key, dim, values_map.get(dim.dim_key)))
             known_fields.add(dim.display_key)
         for attr in dim.attributes:
             if attr.name in df.columns or 1==1:
-                children.append(_dim_field_def(attr.name, dim))
+                children.append(_dim_field_def(attr.name, dim, values_map.get(attr.name)))
                 known_fields.add(attr.name)
         if children:
             defs.append({"headerName": dim.name, "children": children})
@@ -280,6 +333,7 @@ app = Dash(__name__)
 
 initial_model = get_model(DEFAULT_MODEL_ID)
 initial_df = get_flat_table(DEFAULT_MODEL_ID)
+initial_filter_values_map = get_filter_values_map(DEFAULT_MODEL_ID)
 initial_user = get_logged_in_user(DEFAULT_MODEL_ID)
 
 app.layout = html.Div(
@@ -363,7 +417,7 @@ app.layout = html.Div(
                 dag.AgGrid(
                     id="olap-grid",
                     rowData=initial_df.to_dict("records"),
-                    columnDefs=build_column_defs(initial_df, initial_model),
+                    columnDefs=build_column_defs(initial_df, initial_model, initial_filter_values_map),
                     defaultColDef={
                         "flex": 1,
                         "minWidth": 120,
@@ -388,14 +442,17 @@ app.layout = html.Div(
     Input("model-selector", "value"),
     Input("max-rows-input", "value"),
     State("olap-grid", "columnState"),
+    State("olap-grid", "filterModel"),
 )
-def on_model_change(model_id: str, max_rows_value, column_state):
+def on_model_change(model_id: str, max_rows_value, column_state, filter_model):
     selected_model = get_model(model_id)
     request = build_request_from_grid_state(column_state, max_rows_value)
+    request.filters = build_filters_from_filter_model(filter_model)
     selected_df = get_backend(model_id).execute(request)
+    selected_filter_values_map = get_filter_values_map(model_id)
     return (
         selected_df.to_dict("records"),
-        build_column_defs(selected_df, selected_model),
+        build_column_defs(selected_df, selected_model, selected_filter_values_map),
         get_logged_in_user(model_id),
     )
 
@@ -403,11 +460,12 @@ def on_model_change(model_id: str, max_rows_value, column_state):
 @app.callback(
     Output("olap-grid", "rowData", allow_duplicate=True),
     Input("olap-grid", "columnState"),
+    Input("olap-grid", "filterModel"),
     Input("model-selector", "value"),
     Input("max-rows-input", "value"),
     prevent_initial_call=True,
 )
-def on_grid_dimension_change(column_state, model_id: str, max_rows_value):
+def on_grid_dimension_change(column_state, filter_model, model_id: str, max_rows_value):
     """
     Triggered when user drags/drops dimensions to row group or pivot areas.
     
@@ -421,12 +479,11 @@ def on_grid_dimension_change(column_state, model_id: str, max_rows_value):
     logger.info(f"Dimensions changed for model {model_id}")    
     #logger.info(f"Column state: {column_state}")
 
-    if not column_state:
-        return no_update
-
     request = build_request_from_grid_state(column_state, max_rows_value)
+    request.filters = build_filters_from_filter_model(filter_model)
     logger.info(f"Row groups: {request.rows}")
     logger.info(f"Pivot columns: {request.columns}")
+    logger.info(f"Filter fields: {list((request.filters or {}).keys())}")
     
     backend = get_backend(model_id)
     result_df = backend.execute(request)
