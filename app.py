@@ -51,7 +51,6 @@ def load_env_on_startup() -> None:
 
     os.environ.setdefault("DATABRICKS_BACKEND_MODE", "spark")
 
-
 load_env_on_startup()
 
 

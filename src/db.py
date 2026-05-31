@@ -148,6 +148,7 @@ class OlapProcessor:
                 select_cols.append(f"{expr} AS {self._q(key)}")
                 group_by_cols.append(expr)
 
+
         # Only include dimensions whose attributes are requested
         dim_idx = 0
         for dim in self._model.dimensions:
