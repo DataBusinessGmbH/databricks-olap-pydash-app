@@ -297,9 +297,6 @@ def build_grid_options() -> dict:
         "animateRows": True,
         "rowGroupPanelShow": "always",
         "pivotPanelShow": "always",
-        "onFilterChanged": {
-            "function": "onGridFilterChanged(params)"
-        },
         "groupDisplayType": "multipleColumns",
         "groupDefaultExpanded": -1,
         "groupHideOpenParents": True,
@@ -394,8 +391,6 @@ app.layout = html.Div(
     children=[
         # Hidden store to track filter model changes
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
-        # Hidden input as fallback to trigger callback when filter changes
-        dcc.Input(id="filter-model-input", type="hidden", value="{}"),
         html.Div(
             style={
                 "display": "flex",
@@ -498,9 +493,8 @@ app.layout = html.Div(
     Input("max-rows-input", "value"),
     Input("olap-grid", "columnState"),
     Input("filter-change-trigger", "data"),
-    Input("filter-model-input", "value"),
 )
-def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_trigger, filter_model_input):
+def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_trigger):
     """
     Single unified callback — fires on every grid state change:
       - model selector, max rows, column grouping/pivot, filter selections.
@@ -513,7 +507,6 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
 
     print(f"[on_grid_state_change] triggered={triggered}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
-    print(f"[on_grid_state_change] filter_model_input={filter_model_input}", flush=True)
 
     filter_model = {}
     
@@ -524,17 +517,6 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
             filter_model = candidate
             print(f"[on_grid_state_change] using filterModel from Store: {filter_model}", flush=True)
     
-    # Fallback to hidden input
-    if not filter_model and filter_model_input and isinstance(filter_model_input, str):
-        try:
-            import json
-            parsed = json.loads(filter_model_input)
-            if isinstance(parsed, dict) and "filterModel" in parsed:
-                filter_model = parsed["filterModel"]
-                print(f"[on_grid_state_change] using filterModel from input: {filter_model}", flush=True)
-        except Exception as e:
-            print(f"[on_grid_state_change] failed to parse filter_model_input: {e}", flush=True)
-
     selected_model = get_model(model_id)
     request = build_request_from_grid_state(column_state, max_rows_value)
     request.filters = build_filters_from_filter_model(filter_model)
@@ -552,11 +534,10 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
 
     result_df = get_backend(model_id).execute(request)
 
-    # Rebuild column defs on model change; otherwise reuse current schema.
-    rebuild_cols = any(
-        "model-selector" in t or "columnState" not in t
-        for t in triggered
-    )
+    # Rebuild column defs only when model changes.
+    # Rebuilding defs on columnState events can cause AG Grid to emit a second
+    # columnState change while it reapplies column metadata.
+    rebuild_cols = "model-selector.value" in triggered
     new_col_defs = build_column_defs(result_df, selected_model, model_id) if rebuild_cols else dash.no_update
 
     return result_df.to_dict("records"), new_col_defs, get_logged_in_user(model_id)

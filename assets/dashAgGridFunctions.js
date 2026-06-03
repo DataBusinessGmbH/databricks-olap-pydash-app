@@ -170,21 +170,7 @@ dagfuncs.onGridFilterChanged = function (params) {
     }
 
     console.warn("[onGridFilterChanged] dash_clientside.set_props not available");
-
-    // Fallback: update hidden input to trigger callback
-    const hiddenInput = document.getElementById("filter-model-input");
-    if (hiddenInput) {
-      console.info("[onGridFilterChanged] updating hidden input fallback");
-      hiddenInput.value = JSON.stringify({
-        timestamp: Date.now(),
-        filterModel: filterModel,
-      });
-      // Trigger input change event
-      hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
-      return;
-    }
-
-    console.warn("[onGridFilterChanged] no Store or hidden input available");
+    console.warn("[onGridFilterChanged] no Store available");
   } catch (e) {
     console.error("[onGridFilterChanged] failed", String(e), e);
   }
