@@ -256,6 +256,10 @@ def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dic
 
     return parsed, None
 
+
+def filter_button_label(filter_count: int) -> str:
+    return f"Applied filters ({filter_count})"
+
 # ---------------------------------------------------------------------------
 # Grid column-definition builders  (driven entirely by the model)
 # ---------------------------------------------------------------------------
@@ -494,7 +498,7 @@ app.layout = html.Div(
                     ],
                 ),
                 html.Div(
-                    style={"maxWidth": "180px"},
+                    style={"maxWidth": "180px", "paddingRight": "16px"},
                     children=[
                         html.Div("Max rows", style={"fontWeight": "600", "marginBottom": "6px"}),
                         dcc.Input(
@@ -508,11 +512,34 @@ app.layout = html.Div(
                         ),
                     ],
                 ),
+                html.Div(
+                    style={"display": "flex", "gap": "16px", "alignItems": "flex-end"},
+                    children=[
+                        html.Button(
+                            filter_button_label(0),
+                            id="open-filter-json-btn",
+                            n_clicks=0,
+                            style={
+                                "height": "38px",
+                                "padding": "0 14px",
+                                "background": "#f3f4f6",
+                                "border": "1px solid #d1d5db",
+                            },
+                        ),
+                        html.Button(
+                            "Clear Filters",
+                            id="clear-filters-btn",
+                            n_clicks=0,
+                            style={
+                                "height": "38px",
+                                "padding": "0 14px",
+                                "background": "#f3f4f6",
+                                "border": "1px solid #d1d5db",
+                            },
+                        ),
+                    ],
+                ),
             ],
-        ),
-        html.Div(
-            "Use Columns panel for drilldown. Right-click a data cell for Include/Exclude filter actions.",
-            style={"color": "#374151", "marginBottom": "12px"},
         ),
         dcc.Textarea(
             id="server-filter-input",
@@ -520,21 +547,8 @@ app.layout = html.Div(
             style={"display": "none"},
         ),
         html.Div(
-            style={
-                "marginBottom": "12px",
-                "display": "flex",
-                "gap": "10px",
-                "alignItems": "flex-end",
-                "flexWrap": "wrap",
-            },
-            children=[
-                html.Button("Open Filter JSON", id="open-filter-json-btn", n_clicks=0),
-                html.Button("Clear Filters", id="clear-filters-btn", n_clicks=0),
-                html.Div(
-                    id="filter-parse-message",
-                    style={"minWidth": "240px", "fontSize": "13px", "color": "#374151"},
-                ),
-            ],
+            id="filter-parse-message",
+            style={"minWidth": "240px", "fontSize": "13px", "color": "#374151", "marginBottom": "12px"},
         ),
         html.Div(
             id="filter-json-modal",
@@ -683,6 +697,7 @@ def on_clear_filters_sync_input(clear_clicks):
     Output("manual-filter-store", "data"),
     Output("filter-parse-message", "children"),
     Output("filter-parse-message", "style"),
+    Output("open-filter-json-btn", "children"),
     Input("clear-filters-btn", "n_clicks"),
     Input("server-filter-input", "value"),
     State("model-selector", "value"),
@@ -697,6 +712,7 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
             {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}},
             "Filters cleared.",
             {"minWidth": "240px", "fontSize": "13px", "color": "#065f46"},
+            filter_button_label(0),
         )
 
     parsed, error = parse_manual_filters(filter_text, get_model(model_id))
@@ -705,12 +721,14 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
             no_update,
             error,
             {"minWidth": "240px", "fontSize": "13px", "color": "#b91c1c"},
+            no_update,
         )
 
     return (
         {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": parsed},
-        f"Applied {len(parsed)} filter field(s).",
-        {"minWidth": "240px", "fontSize": "13px", "color": "#065f46"},
+        "",
+        {"minWidth": "240px", "fontSize": "13px", "color": "#374151"},
+        filter_button_label(len(parsed)),
     )
 
 

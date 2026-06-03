@@ -194,6 +194,7 @@ dagfuncs.readCurrentFilters = function () {
 
 dagfuncs.writeCurrentFilters = function (currentFilters) {
   const pretty = JSON.stringify(currentFilters, null, 2);
+  const filterCount = Object.keys(currentFilters || {}).length;
   if (window.dash_clientside && typeof window.dash_clientside.set_props === "function") {
     window.dash_clientside.set_props("server-filter-input", { value: pretty });
     window.dash_clientside.set_props("manual-filter-store", {
@@ -202,9 +203,12 @@ dagfuncs.writeCurrentFilters = function (currentFilters) {
         filters: currentFilters,
       },
     });
+    window.dash_clientside.set_props("open-filter-json-btn", {
+      children: `Applied filters (${filterCount})`,
+    });
     window.dash_clientside.set_props("filter-parse-message", {
-      children: `Applied ${Object.keys(currentFilters).length} filter field(s).`,
-      style: { minWidth: "240px", fontSize: "13px", color: "#065f46" },
+      children: "",
+      style: { minWidth: "240px", fontSize: "13px", color: "#374151" },
     });
   }
 };
