@@ -13,6 +13,7 @@ DatabricksBackend instantiation for another OlapDatabase implementation.
 
 from pathlib import Path
 import os
+import json
 from flask import jsonify, request as flask_request
 
 import dash_ag_grid as dag
@@ -161,8 +162,8 @@ def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequ
     )
 
 
-def build_filters_from_filter_model(filter_model) -> dict[str, list]:
-    filters: dict[str, list] = {}
+def build_filters_from_filter_model(filter_model) -> dict[str, dict[str, list]]:
+    filters: dict[str, dict[str, list]] = {}
     if not filter_model:
         return filters
 
@@ -172,12 +173,12 @@ def build_filters_from_filter_model(filter_model) -> dict[str, list]:
 
         values = cfg.get("values")
         if isinstance(values, list) and values:
-            filters[field_name] = values
+            filters[field_name] = {"in": values}
             continue
 
         single = cfg.get("filter")
         if single not in (None, ""):
-            filters[field_name] = [single]
+            filters[field_name] = {"in": [single]}
 
     return filters
 
@@ -188,6 +189,72 @@ def get_model_dropdown_options() -> list[dict[str, str]]:
         label = get_model(model_id).name
         options.append({"label": label, "value": model_id})
     return options
+
+
+def get_allowed_filter_fields(model: OlapModel) -> set[str]:
+    fields: set[str] = set(model.fact.join_keys)
+    for dim in model.dimensions:
+        fields.add(dim.dim_key)
+        fields.add(dim.display_key)
+        for attr in dim.attributes:
+            fields.add(attr.name)
+    return fields
+
+
+def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dict[str, dict[str, list]], str | None]:
+    text = (filter_text or "").strip()
+    if not text:
+        return {}, None
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return {}, f"Invalid JSON at line {exc.lineno}, column {exc.colno}."
+
+    if not isinstance(raw, dict):
+        return {}, "Filter JSON must be an object: {\"field\": [values...]}"
+
+    allowed = get_allowed_filter_fields(model)
+    parsed: dict[str, dict[str, list]] = {}
+
+    for field, value in raw.items():
+        if field not in allowed:
+            return {}, f"Unknown filter field: {field}"
+
+        # Backward-compatible simple form: {"field": [..]} or {"field": "x"}
+        if not isinstance(value, dict):
+            values = value if isinstance(value, list) else [value]
+            cleaned = [v for v in values if v not in (None, "")]
+            if cleaned:
+                parsed[field] = {"in": cleaned}
+            continue
+
+        unknown_ops = [k for k in value.keys() if k not in ("in", "not_in")]
+        if unknown_ops:
+            return {}, f"Unsupported operator for {field}: {', '.join(unknown_ops)}"
+
+        includes = value.get("in", [])
+        excludes = value.get("not_in", [])
+
+        includes = includes if isinstance(includes, list) else [includes]
+        excludes = excludes if isinstance(excludes, list) else [excludes]
+
+        includes_clean = [v for v in includes if v not in (None, "")]
+        excludes_clean = [v for v in excludes if v not in (None, "")]
+
+        overlap = set(map(str, includes_clean)).intersection(set(map(str, excludes_clean)))
+        if overlap:
+            return {}, f"Conflicting include/exclude values for {field}: {', '.join(sorted(overlap))}"
+
+        spec: dict[str, list] = {}
+        if includes_clean:
+            spec["in"] = includes_clean
+        if excludes_clean:
+            spec["not_in"] = excludes_clean
+        if spec:
+            parsed[field] = spec
+
+    return parsed, None
 
 # ---------------------------------------------------------------------------
 # Grid column-definition builders  (driven entirely by the model)
@@ -210,15 +277,13 @@ def _dim_field_def(col_name: str, dim: DimensionDef, model_id: str) -> dict:
     col_def = {
         "field": col_name,
         "headerName": label,
+        "isDimension": True,
         "sortable": True,
-        "filter": "agSetColumnFilter",
+        "filter": False,
         "resizable": True,
         "hide": is_display_key,
         "enablePivot": True,
         "enableRowGroup": True,
-        "filterParams": {
-            "function": f"buildLazyFilterParams('{model_id}', 500)"
-        },
     }
 
     return col_def
@@ -229,8 +294,9 @@ def _metric_field_def(metric: MetricDef) -> dict:
     return {
         "field": metric.name,
         "headerName": metric.label,
+        "isDimension": False,
         "sortable": True,
-        "filter": True,
+        "filter": False,
         "resizable": True,
         "type": "numericColumn",
         "enableValue": True,
@@ -244,6 +310,7 @@ def _join_key_field_def(key: str) -> dict:
     return {
         "field": key,
         "headerName": _label(key),
+        "isDimension": False,
         "hide": True,
         "sortable": False,
         "filter": False,
@@ -311,13 +378,6 @@ def build_grid_options() -> dict:
                     "iconKey": "columns",
                     "toolPanel": "agColumnsToolPanel",
                     "toolPanelParams": {"suppressRowGroups": False},
-                },
-                {
-                    "id": "filters",
-                    "labelDefault": "Filters",
-                    "labelKey": "filters",
-                    "iconKey": "filter",
-                    "toolPanel": "agFiltersToolPanel",
                 },
             ],
             "defaultToolPanel": "columns",
@@ -391,6 +451,7 @@ app.layout = html.Div(
     children=[
         # Hidden store to track filter model changes
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
+        dcc.Store(id="manual-filter-store", data={"timestamp": 0, "filters": {}}),
         html.Div(
             style={
                 "display": "flex",
@@ -449,8 +510,46 @@ app.layout = html.Div(
             ],
         ),
         html.Div(
-            "Use the right-side collapsible panel to switch between Columns and Filters.",
+            "Use Columns panel for drilldown, and the JSON box below for server-side filters.",
             style={"color": "#374151", "marginBottom": "12px"},
+        ),
+        html.Div(
+            style={
+                "marginBottom": "12px",
+                "display": "flex",
+                "gap": "10px",
+                "alignItems": "flex-end",
+                "flexWrap": "wrap",
+            },
+            children=[
+                html.Div(
+                    style={"flex": "1", "minWidth": "340px"},
+                    children=[
+                        html.Div("Server Filters (JSON)", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Textarea(
+                            id="server-filter-input",
+                            value="{}",
+                            style={
+                                "width": "100%",
+                                "height": "72px",
+                                "padding": "8px",
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                            },
+                        ),
+                        html.Div(
+                            'Example: {"year": {"in": [2024]}, "region": {"not_in": ["APAC"]}}',
+                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "4px"},
+                        ),
+                    ],
+                ),
+                html.Button("Apply Filters", id="apply-filters-btn", n_clicks=0),
+                html.Button("Clear Filters", id="clear-filters-btn", n_clicks=0),
+                html.Div(
+                    id="filter-parse-message",
+                    style={"minWidth": "240px", "fontSize": "13px", "color": "#374151"},
+                ),
+            ],
         ),
         html.Div(
             style={
@@ -465,7 +564,8 @@ app.layout = html.Div(
                     rowData=initial_df.to_dict("records"),
                     columnDefs=build_column_defs(initial_df, initial_model, DEFAULT_MODEL_ID),
                     eventListeners={
-                        "filterChanged": ["onGridFilterChanged(params)"]
+                        "filterChanged": ["onGridFilterChanged(params)"],
+                        "columnHeaderClicked": ["onColumnHeaderClicked(params)"],
                     },                    
                     dangerously_allow_code=True,
                     defaultColDef={
@@ -486,6 +586,42 @@ app.layout = html.Div(
 
 
 @app.callback(
+    Output("manual-filter-store", "data"),
+    Output("filter-parse-message", "children"),
+    Output("filter-parse-message", "style"),
+    Input("apply-filters-btn", "n_clicks"),
+    Input("clear-filters-btn", "n_clicks"),
+    State("server-filter-input", "value"),
+    State("model-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_manual_filter_change(apply_clicks, clear_clicks, filter_text, model_id: str):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    if triggered == "clear-filters-btn.n_clicks":
+        return (
+            {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}},
+            "Filters cleared.",
+            {"minWidth": "240px", "fontSize": "13px", "color": "#065f46"},
+        )
+
+    parsed, error = parse_manual_filters(filter_text, get_model(model_id))
+    if error:
+        return (
+            no_update,
+            error,
+            {"minWidth": "240px", "fontSize": "13px", "color": "#b91c1c"},
+        )
+
+    return (
+        {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": parsed},
+        f"Applied {len(parsed)} filter field(s).",
+        {"minWidth": "240px", "fontSize": "13px", "color": "#065f46"},
+    )
+
+
+@app.callback(
     Output("olap-grid", "rowData"),
     Output("olap-grid", "columnDefs"),
     Output("logged-in-user", "children"),
@@ -493,8 +629,9 @@ app.layout = html.Div(
     Input("max-rows-input", "value"),
     Input("olap-grid", "columnState"),
     Input("filter-change-trigger", "data"),
+    Input("manual-filter-store", "data"),
 )
-def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_trigger):
+def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_trigger, manual_filter_data):
     """
     Single unified callback — fires on every grid state change:
       - model selector, max rows, column grouping/pivot, filter selections.
@@ -507,6 +644,7 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
 
     print(f"[on_grid_state_change] triggered={triggered}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
+    print(f"[on_grid_state_change] manual_filter_data={manual_filter_data}", flush=True)
 
     filter_model = {}
     
@@ -516,10 +654,17 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
         if isinstance(candidate, dict):
             filter_model = candidate
             print(f"[on_grid_state_change] using filterModel from Store: {filter_model}", flush=True)
+
+    manual_filters: dict[str, dict[str, list]] = {}
+    if isinstance(manual_filter_data, dict):
+        candidate = manual_filter_data.get("filters")
+        if isinstance(candidate, dict):
+            manual_filters = candidate
     
     selected_model = get_model(model_id)
     request = build_request_from_grid_state(column_state, max_rows_value)
     request.filters = build_filters_from_filter_model(filter_model)
+    request.filters.update(manual_filters)
 
     LOGGER.info(
         "Grid state change: model=%s rows=%s pivots=%s filters=%s max_rows=%s trigger=%s raw_filter_model=%s",

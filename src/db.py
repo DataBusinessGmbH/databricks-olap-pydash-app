@@ -84,13 +84,14 @@ class OlapQueryRequest:
                Empty list → no pivot.
     metrics  – metric names to aggregate (must be defined in model.yaml).
                Empty list → return all metrics.
-    filters  – {attribute_name: [allowed_value, ...]} equality filters.
+    filters  – {attribute_name: {"in": [...], "not_in": [...]}} filters.
+               Legacy form {attribute_name: [...]} is still supported.
                Empty dict → no filtering.
     """
     rows: list[str] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
     metrics: list[str] = field(default_factory=list)
-    filters: dict[str, list] = field(default_factory=dict)
+    filters: dict[str, dict[str, list] | list] = field(default_factory=dict)
     max_rows: int | None = None
 
 # ---------------------------------------------------------------------------
@@ -191,7 +192,7 @@ class OlapProcessor:
             if request and request.filters:
                 for key_field in (dim.dim_key, dim.display_key):
                     if key_field in request.filters and request.filters[key_field]:
-                        where_sql = self._in_filter_sql(
+                        where_sql = self._filter_sql(
                             f"{fact_alias}.{self._q(dim.fact_key)}",
                             request.filters[key_field],
                         )
@@ -218,7 +219,7 @@ class OlapProcessor:
             # filters on dimension attributes
             if request and request.filters:
                 for attr_name in dim_filter_attr_names:
-                    where_sql = self._in_filter_sql(
+                    where_sql = self._filter_sql(
                         f"{d_alias}.{self._q(attr_name)}",
                         request.filters[attr_name],
                     )
@@ -229,7 +230,7 @@ class OlapProcessor:
         if request and request.filters:
             for key in self._model.fact.join_keys:
                 if key in request.filters and request.filters[key]:
-                    where_sql = self._in_filter_sql(
+                    where_sql = self._filter_sql(
                         f"{fact_alias}.{self._q(key)}",
                         request.filters[key],
                     )
@@ -377,6 +378,52 @@ class OlapProcessor:
             return None
         # Compare as strings to match AG Grid filter model values consistently
         return f"CAST({expr} AS STRING) IN ({', '.join(literals)})"
+
+    @classmethod
+    def _not_in_filter_sql(cls, expr: str, excluded_values: list) -> str | None:
+        literals = [cls._sql_literal(v) for v in (excluded_values or [])]
+        literals = [v for v in literals if v is not None]
+        if not literals:
+            return None
+        # Keep NULL rows when excluding explicit values.
+        return f"({expr} IS NULL OR CAST({expr} AS STRING) NOT IN ({', '.join(literals)}))"
+
+    @classmethod
+    def _normalize_filter_spec(cls, spec) -> dict[str, list]:
+        # Backward-compatible: list means include list.
+        if isinstance(spec, list):
+            return {"in": spec}
+        if not isinstance(spec, dict):
+            return {}
+        includes = spec.get("in", [])
+        excludes = spec.get("not_in", [])
+        if not isinstance(includes, list):
+            includes = [includes]
+        if not isinstance(excludes, list):
+            excludes = [excludes]
+        return {
+            "in": [v for v in includes if v is not None],
+            "not_in": [v for v in excludes if v is not None],
+        }
+
+    @classmethod
+    def _filter_sql(cls, expr: str, spec) -> str | None:
+        normalized = cls._normalize_filter_spec(spec)
+        parts: list[str] = []
+
+        in_sql = cls._in_filter_sql(expr, normalized.get("in", []))
+        if in_sql:
+            parts.append(in_sql)
+
+        not_in_sql = cls._not_in_filter_sql(expr, normalized.get("not_in", []))
+        if not_in_sql:
+            parts.append(not_in_sql)
+
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        return "(" + " AND ".join(parts) + ")"
 
     def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
         LOGGER.debug(
