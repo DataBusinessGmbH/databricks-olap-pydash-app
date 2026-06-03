@@ -228,6 +228,44 @@ def get_flat_table(model_id: str) -> pd.DataFrame:
     return get_backend(model_id).execute(request)
 
 
+def build_default_request(model: OlapModel, max_rows: int | None = None) -> OlapQueryRequest:
+    default_rows: list[str] = []
+    default_metrics = [metric.name for metric in model.metrics if metric.default_show]
+
+    for dim in model.dimensions:
+        if dim.default_show:
+            default_rows.append(dim.dim_key)
+        for attr in dim.attributes:
+            if attr.default_show:
+                default_rows.append(attr.name)
+
+    if not default_rows and not default_metrics:
+        return OlapQueryRequest(max_rows=max_rows)
+
+    deduped_rows = list(dict.fromkeys(default_rows))
+    return OlapQueryRequest(rows=deduped_rows, metrics=default_metrics, max_rows=max_rows)
+
+
+def get_default_view_table(model_id: str, max_rows: int | None = None) -> pd.DataFrame:
+    model = get_model(model_id)
+    request = build_default_request(model, max_rows=max_rows or DEFAULT_MAX_ROWS)
+    return get_backend(model_id).execute(request)
+
+
+def get_default_visible_fields(model: OlapModel) -> set[str]:
+    visible_fields: set[str] = set()
+    for dim in model.dimensions:
+        if dim.default_show:
+            visible_fields.add(dim.dim_key)
+        for attr in dim.attributes:
+            if attr.default_show:
+                visible_fields.add(attr.name)
+    for metric in model.metrics:
+        if metric.default_show:
+            visible_fields.add(metric.name)
+    return visible_fields
+
+
 def sanitize_max_rows(value) -> int | None:
     if value in (None, ""):
         return DEFAULT_MAX_ROWS
@@ -501,22 +539,36 @@ def build_column_defs(
     """
     defs: list[dict] = []
     known_fields: set[str] = set()
+    default_visible_fields = get_default_visible_fields(model)
+    has_default_visibility = bool(default_visible_fields)
 
     # Dimension groups
     for dim in model.dimensions:
         children: list[dict] = []
         if dim.display_key in df.columns or 1==1:
-            children.append(_dim_field_def(dim.dim_key, dim, model_id))
+            key_def = _dim_field_def(dim.dim_key, dim, model_id)
+            if has_default_visibility:
+                key_def["hide"] = dim.dim_key not in default_visible_fields
+            children.append(key_def)
             known_fields.add(dim.dim_key)
         for attr in dim.attributes:
             if attr.name in df.columns or 1==1:
-                children.append(_dim_field_def(attr.name, dim, model_id))
+                attr_def = _dim_field_def(attr.name, dim, model_id)
+                if has_default_visibility:
+                    attr_def["hide"] = attr.name not in default_visible_fields
+                children.append(attr_def)
                 known_fields.add(attr.name)
         if children:
             defs.append({"headerName": dim.name, "children": children})
 
     # Metrics group
-    metric_children = [_metric_field_def(m) for m in model.metrics if m.name in df.columns]
+    metric_children = []
+    for metric in model.metrics:
+        if metric.name in df.columns:
+            metric_def = _metric_field_def(metric)
+            if has_default_visibility:
+                metric_def["hide"] = metric.name not in default_visible_fields
+            metric_children.append(metric_def)
     for child in metric_children:
         known_fields.add(child["field"])
     if metric_children:
@@ -610,7 +662,7 @@ def api_filter_values():
         return jsonify({"values": []})
 
 initial_model = get_model(DEFAULT_MODEL_ID)
-initial_df = get_flat_table(DEFAULT_MODEL_ID)
+initial_df = get_default_view_table(DEFAULT_MODEL_ID)
 initial_user = get_logged_in_user(DEFAULT_MODEL_ID)
 
 app.layout = html.Div(
@@ -1146,7 +1198,8 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
             manual_filters = candidate
     
     selected_model = get_model(model_id)
-    request = build_request_from_grid_state(column_state, max_rows_value)
+    rebuild_cols = "model-selector.value" in triggered
+    request = build_default_request(selected_model, sanitize_max_rows(max_rows_value)) if rebuild_cols else build_request_from_grid_state(column_state, max_rows_value)
     request.filters = build_filters_from_filter_model(filter_model)
     request.filters.update(manual_filters)
 
@@ -1166,7 +1219,6 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
     # Rebuild column defs only when model changes.
     # Rebuilding defs on columnState events can cause AG Grid to emit a second
     # columnState change while it reapplies column metadata.
-    rebuild_cols = "model-selector.value" in triggered
     new_col_defs = build_column_defs(result_df, selected_model, model_id) if rebuild_cols else dash.no_update
 
     return result_df.to_dict("records"), new_col_defs, get_logged_in_user(model_id)

@@ -26,6 +26,7 @@ class AttributeDef:
     name: str
     label: str
     type: Literal["string", "integer", "numeric", "date"]
+    default_show: bool = False  # Ensure this is parsed from YAML
 
 
 @dataclass
@@ -36,6 +37,7 @@ class MetricDef:
     type: Literal["numeric", "integer"]
     default_agg: str
     allowed_aggs: list[str]
+    default_show: bool = False  # Ensure this is parsed from YAML
 
 
 @dataclass
@@ -48,6 +50,7 @@ class DimensionDef:
     fact_key: str       # FK column on the fact table
     dim_key: str        # PK column on the dimension table
     display_key: str    # Synthetic alias shown in the UI (Key column)
+    default_show: bool = False  # Ensure this is parsed from YAML
     attributes: list[AttributeDef] = field(default_factory=list)
 
     @property
@@ -117,6 +120,7 @@ class OlapModel:
                     type=m.get("type", "numeric"),
                     default_agg=m.get("default_agg", "sum"),
                     allowed_aggs=m.get("allowed_aggs", ["sum"]),
+                        default_show=bool(m.get("default_show", False)),  # Parse from YAML
                 )
                 for m in rf.get("metrics", [])
             ],
@@ -132,11 +136,13 @@ class OlapModel:
                 fact_key=d["fact_key"],
                 dim_key=d["dim_key"],
                 display_key=d["display_key"],
+                    default_show=bool(d.get("default_show", False)),  # Parse from YAML
                 attributes=[
                     AttributeDef(
                         name=a["name"],
                         label=a.get("label", a["name"]),
                         type=a.get("type", "string"),
+                            default_show=bool(a.get("default_show", False)),  # Parse from YAML
                     )
                     for a in d.get("attributes", [])
                 ],
