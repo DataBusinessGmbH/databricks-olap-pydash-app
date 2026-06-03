@@ -130,6 +130,14 @@ class OlapProcessor:
         where_clauses: list[str] = []
         join_sql = []
 
+        LOGGER.info(
+            "Building SQL for request: rows=%s columns=%s metrics=%s filters=%s",
+            request.rows if request else None,
+            request.columns if request else None,
+            request.metrics if request else None,
+            request.filters.keys() if request and request.filters else None            
+        )
+
         # Determine which dimension attributes are needed
         requested_cols = set()
         if request:
@@ -166,13 +174,18 @@ class OlapProcessor:
                 dim_attrs_to_include = [a.name for a in dim.attributes if a.name in requested_cols]
 
             # Synthetic display key (alias of fact foreign key) — include if dimension is used
-            if dim.dim_key in requested_cols or include_all_dims==True:
+            if dim.dim_key in requested_cols or include_all_dims==True :
                 display_key_expr = f"{fact_alias}.{self._q(dim.fact_key)}"
                 select_cols.append(
                     f"{display_key_expr} AS {self._q(dim.dim_key)}"
                 )
                 group_by_cols.append(display_key_expr)      
                 dim_key_include = True  # Flag to indicate we need to join this dimension
+
+            # If any attribute from this dimension is requested, we also need to join the dimension
+            if len(dim_attrs_to_include)>0:
+                dim_key_include = True  # Flag to indicate we need to join this dimension
+
 
             # key filters on dim key/display key are applied against fact foreign key
             if request and request.filters:
