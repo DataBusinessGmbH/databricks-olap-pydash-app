@@ -677,6 +677,22 @@ app.layout = html.Div(
         # Hidden store to track filter model changes
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
         dcc.Store(id="manual-filter-store", data={"timestamp": 0, "filters": {}}),
+        dcc.Input(id="field-filter-active-model", value=DEFAULT_MODEL_ID, style={"display": "none"}),
+        dcc.Input(
+            id="field-filter-active-field",
+            value=(
+                get_field_filter_dropdown_options(
+                    DEFAULT_MODEL_ID,
+                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
+                )[0]["value"]
+                if get_field_filter_dropdown_options(
+                    DEFAULT_MODEL_ID,
+                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
+                )
+                else ""
+            ),
+            style={"display": "none"},
+        ),
         html.Div(
             id="startup-warning-banner",
             children=[
@@ -1032,6 +1048,8 @@ def on_clear_filters_sync_input(clear_clicks):
 
 
 @app.callback(
+    Output("field-filter-active-model", "value"),
+    Output("field-filter-active-field", "value"),
     Output("field-filter-dimension-selector", "options"),
     Output("field-filter-dimension-selector", "value"),
     Output("field-filter-selector", "options"),
@@ -1052,7 +1070,18 @@ def on_model_or_dimension_change_update_field_filter_options(
     field_options = get_field_filter_dropdown_options(model_id, next_dimension)
     field_values = {o["value"] for o in field_options}
     next_field = current_field if current_field in field_values else (field_options[0]["value"] if field_options else None)
-    return dim_options, next_dimension, field_options, next_field
+    return model_id, next_field or "", dim_options, next_dimension, field_options, next_field
+
+
+@app.callback(
+    Output("field-filter-active-model", "value", allow_duplicate=True),
+    Output("field-filter-active-field", "value", allow_duplicate=True),
+    Input("model-selector", "value"),
+    Input("field-filter-selector", "value"),
+    prevent_initial_call=True,
+)
+def sync_value_help_context(model_id: str, field_name: str | None):
+    return model_id, field_name or ""
 
 
 @app.callback(

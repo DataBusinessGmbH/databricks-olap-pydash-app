@@ -501,6 +501,269 @@ dagfuncs.openFieldFilterDialog = async function (params) {
   }
 };
 
+dagfuncs.fetchDistinctFieldValues = function (modelId, fieldName, maxValues) {
+  const resolvedMaxValues = maxValues || 500;
+  if (!modelId || !fieldName) {
+    return Promise.resolve([]);
+  }
+
+  const url = `/api/filter-values?model_id=${encodeURIComponent(modelId)}&field_name=${encodeURIComponent(fieldName)}&max_values=${encodeURIComponent(resolvedMaxValues)}`;
+  return fetch(url)
+    .then((resp) => {
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return resp.json();
+    })
+    .then((payload) => (Array.isArray(payload && payload.values) ? payload.values : []))
+    .catch((error) => {
+      console.error("[fetchDistinctFieldValues] failed", { modelId, fieldName, error: String(error) });
+      return [];
+    });
+};
+
+dagfuncs.openDistinctValuePicker = function (options) {
+  const fieldLabel = options && options.fieldLabel ? options.fieldLabel : "Field";
+  const mode = options && options.mode ? options.mode : "include";
+  const values = Array.isArray(options && options.values) ? options.values : [];
+  const existingValues = Array.isArray(options && options.existingValues) ? options.existingValues : [];
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.background = "rgba(0, 0, 0, 0.35)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.zIndex = "10001";
+
+    const modal = document.createElement("div");
+    modal.style.width = "720px";
+    modal.style.maxWidth = "95vw";
+    modal.style.maxHeight = "85vh";
+    modal.style.background = "#ffffff";
+    modal.style.borderRadius = "10px";
+    modal.style.padding = "14px";
+    modal.style.boxShadow = "0 10px 30px rgba(0, 0, 0, 0.2)";
+    modal.style.fontFamily = "Arial, sans-serif";
+    modal.style.boxSizing = "border-box";
+    modal.style.display = "flex";
+    modal.style.flexDirection = "column";
+    modal.style.gap = "10px";
+
+    const titleRow = document.createElement("div");
+    titleRow.style.display = "flex";
+    titleRow.style.justifyContent = "space-between";
+    titleRow.style.alignItems = "center";
+
+    const title = document.createElement("div");
+    title.textContent = `${mode === "exclude" ? "Exclude" : "Include"} values for ${fieldLabel}`;
+    title.style.fontWeight = "700";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "X";
+    closeBtn.style.border = "1px solid #d1d5db";
+    closeBtn.style.background = "#fff";
+    closeBtn.style.borderRadius = "6px";
+    closeBtn.style.padding = "4px 8px";
+    closeBtn.style.cursor = "pointer";
+    closeBtn.style.fontWeight = "700";
+
+    titleRow.appendChild(title);
+    titleRow.appendChild(closeBtn);
+
+    const hint = document.createElement("div");
+    hint.textContent = "Select one or more distinct values, then Apply.";
+    hint.style.fontSize = "12px";
+    hint.style.color = "#6b7280";
+
+    const filterInput = document.createElement("input");
+    filterInput.type = "text";
+    filterInput.placeholder = "Search values...";
+    filterInput.style.width = "100%";
+    filterInput.style.boxSizing = "border-box";
+    filterInput.style.padding = "8px";
+    filterInput.style.border = "1px solid #d1d5db";
+    filterInput.style.borderRadius = "6px";
+
+    const listWrap = document.createElement("div");
+    listWrap.style.border = "1px solid #e5e7eb";
+    listWrap.style.borderRadius = "8px";
+    listWrap.style.padding = "8px";
+    listWrap.style.overflow = "auto";
+    listWrap.style.maxHeight = "48vh";
+    listWrap.style.background = "#f9fafb";
+
+    const selectedSet = new Set(existingValues.map((v) => String(v)));
+
+    const renderList = function () {
+      const searchTerm = (filterInput.value || "").trim().toLowerCase();
+      listWrap.innerHTML = "";
+
+      const filteredValues = values.filter((value) => String(value).toLowerCase().includes(searchTerm));
+      if (filteredValues.length === 0) {
+        const empty = document.createElement("div");
+        empty.textContent = values.length === 0 ? "No values available." : "No values match the current search.";
+        empty.style.fontSize = "12px";
+        empty.style.color = "#6b7280";
+        listWrap.appendChild(empty);
+        return;
+      }
+
+      filteredValues.forEach((value, index) => {
+        const stringValue = String(value);
+        const row = document.createElement("label");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "8px";
+        row.style.padding = "6px 4px";
+        row.style.cursor = "pointer";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = selectedSet.has(stringValue);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            selectedSet.add(stringValue);
+          } else {
+            selectedSet.delete(stringValue);
+          }
+        });
+
+        const text = document.createElement("span");
+        text.textContent = stringValue;
+        text.style.wordBreak = "break-word";
+
+        row.appendChild(checkbox);
+        row.appendChild(text);
+        listWrap.appendChild(row);
+
+        if (index < filteredValues.length - 1) {
+          const divider = document.createElement("div");
+          divider.style.height = "1px";
+          divider.style.background = "#e5e7eb";
+          listWrap.appendChild(divider);
+        }
+      });
+    };
+
+    const buttonRow = document.createElement("div");
+    buttonRow.style.display = "flex";
+    buttonRow.style.justifyContent = "flex-end";
+    buttonRow.style.gap = "8px";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.padding = "6px 10px";
+
+    const applyBtn = document.createElement("button");
+    applyBtn.textContent = "Apply";
+    applyBtn.style.padding = "6px 10px";
+
+    buttonRow.appendChild(cancelBtn);
+    buttonRow.appendChild(applyBtn);
+
+    modal.appendChild(titleRow);
+    modal.appendChild(hint);
+    modal.appendChild(filterInput);
+    modal.appendChild(listWrap);
+    modal.appendChild(buttonRow);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const close = (result) => {
+      if (overlay.parentNode) {
+        overlay.parentNode.removeChild(overlay);
+      }
+      resolve(result);
+    };
+
+    closeBtn.addEventListener("click", () => close({ confirmed: false }));
+    cancelBtn.addEventListener("click", () => close({ confirmed: false }));
+    applyBtn.addEventListener("click", () => close({ confirmed: true, values: Array.from(selectedSet) }));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) {
+        close({ confirmed: false });
+      }
+    });
+    filterInput.addEventListener("input", renderList);
+
+    renderList();
+    filterInput.focus();
+  });
+};
+
+dagfuncs.handleQuestionMarkFieldLookup = async function (inputId, mode) {
+  const inputEl = document.getElementById(inputId);
+  const modelEl = document.getElementById("field-filter-active-model");
+  const fieldEl = document.getElementById("field-filter-active-field");
+
+  if (!inputEl || !modelEl || !fieldEl) {
+    return;
+  }
+
+  const currentValue = (inputEl.value || "").trim();
+  if (currentValue !== "?") {
+    return;
+  }
+
+  const modelId = modelEl.value || "";
+  const fieldName = fieldEl.value || "";
+  if (!modelId || !fieldName) {
+    return;
+  }
+
+  const distinctValues = await dagfuncs.fetchDistinctFieldValues(modelId, fieldName, 500);
+  const selected = await dagfuncs.openDistinctValuePicker({
+    fieldLabel: fieldName,
+    mode: mode,
+    values: distinctValues,
+    existingValues: [],
+  });
+
+  if (!selected || !selected.confirmed) {
+    return;
+  }
+
+  const csvValue = (selected.values || []).join(", ");
+  if (window.dash_clientside && typeof window.dash_clientside.set_props === "function") {
+    window.dash_clientside.set_props(inputId, { value: csvValue });
+  } else {
+    inputEl.value = csvValue;
+  }
+
+  // Keep focus on the edited field so users can review before explicitly applying.
+  setTimeout(() => inputEl.focus(), 0);
+};
+
+dagfuncs.installFieldLookupHotkey = function () {
+  if (window.__fieldLookupHotkeyInstalled) {
+    return;
+  }
+  window.__fieldLookupHotkeyInstalled = true;
+
+  document.addEventListener("keydown", function (event) {
+    const target = event.target;
+    if (!target || event.key !== "Enter") {
+      return;
+    }
+
+    if (target.id === "field-filter-include-input" && String(target.value || "").trim() === "?") {
+      event.preventDefault();
+      dagfuncs.handleQuestionMarkFieldLookup("field-filter-include-input", "include");
+      return;
+    }
+
+    if (target.id === "field-filter-exclude-input" && String(target.value || "").trim() === "?") {
+      event.preventDefault();
+      dagfuncs.handleQuestionMarkFieldLookup("field-filter-exclude-input", "exclude");
+    }
+  });
+};
+
+dagfuncs.installFieldLookupHotkey();
+
 // Expose for AG Grid dashGridOptions callback usage.
 window.onGridFilterChanged = dagfuncs.onGridFilterChanged;
 window.getCustomContextMenuItems = dagfuncs.getCustomContextMenuItems;
