@@ -176,6 +176,150 @@ dagfuncs.onGridFilterChanged = function (params) {
   }
 };
 
+dagfuncs.readCurrentFilters = function () {
+  const textarea = document.getElementById("server-filter-input");
+  if (!textarea || !textarea.value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(textarea.value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (e) {
+    // Ignore malformed content and fall back to empty object.
+  }
+  return {};
+};
+
+dagfuncs.writeCurrentFilters = function (currentFilters) {
+  const pretty = JSON.stringify(currentFilters, null, 2);
+  if (window.dash_clientside && typeof window.dash_clientside.set_props === "function") {
+    window.dash_clientside.set_props("server-filter-input", { value: pretty });
+    window.dash_clientside.set_props("manual-filter-store", {
+      data: {
+        timestamp: Date.now(),
+        filters: currentFilters,
+      },
+    });
+    window.dash_clientside.set_props("filter-parse-message", {
+      children: `Applied ${Object.keys(currentFilters).length} filter field(s).`,
+      style: { minWidth: "240px", fontSize: "13px", color: "#065f46" },
+    });
+  }
+};
+
+dagfuncs.normalizeFilterSpec = function (spec) {
+  let existingIn = [];
+  let existingOut = [];
+  if (Array.isArray(spec)) {
+    existingIn = spec;
+  } else if (spec && typeof spec === "object") {
+    const maybeIn = spec.in;
+    const maybeOut = spec.not_in;
+    existingIn = Array.isArray(maybeIn) ? maybeIn : (maybeIn ? [maybeIn] : []);
+    existingOut = Array.isArray(maybeOut) ? maybeOut : (maybeOut ? [maybeOut] : []);
+  }
+  return { existingIn, existingOut };
+};
+
+dagfuncs.applySingleCellFilter = function (field, rawValue, mode) {
+  const value = rawValue === null || rawValue === undefined ? "" : String(rawValue).trim();
+  if (!field || !value) {
+    return;
+  }
+
+  const dedupe = (arr) => Array.from(new Set(arr.filter((v) => v && String(v).trim().length > 0)));
+  const currentFilters = dagfuncs.readCurrentFilters();
+  const normalized = dagfuncs.normalizeFilterSpec(currentFilters[field]);
+
+  let inVals = dedupe(normalized.existingIn.map((v) => String(v).trim()));
+  let outVals = dedupe(normalized.existingOut.map((v) => String(v).trim()));
+
+  if (mode === "include") {
+    inVals = dedupe([...inVals, value]);
+    outVals = outVals.filter((v) => v !== value);
+  } else if (mode === "exclude") {
+    outVals = dedupe([...outVals, value]);
+    inVals = inVals.filter((v) => v !== value);
+  }
+
+  if (inVals.length === 0 && outVals.length === 0) {
+    delete currentFilters[field];
+  } else {
+    const spec = {};
+    if (inVals.length > 0) {
+      spec.in = inVals;
+    }
+    if (outVals.length > 0) {
+      spec.not_in = outVals;
+    }
+    currentFilters[field] = spec;
+  }
+
+  dagfuncs.writeCurrentFilters(currentFilters);
+};
+
+dagfuncs.getCustomContextMenuItems = function (params) {
+  const column = params && params.column ? params.column : null;
+  const colDef = (column && typeof column.getColDef === "function") ? column.getColDef() : (params && params.colDef ? params.colDef : null);
+  const field = (column && typeof column.getColId === "function")
+    ? column.getColId()
+    : (colDef && colDef.field ? colDef.field : null);
+  const rawValue = params ? params.value : undefined;
+
+  const defaults = ["copy", "copyWithHeaders", "separator", "export"];
+  // AG Grid may not preserve custom metadata (like isDimension) in context menu params.
+  // Offer actions for any concrete data column cell.
+  if (!field || field === "ag-Grid-AutoColumn") {
+    return defaults;
+  }
+
+  const currentFilters = dagfuncs.readCurrentFilters();
+  const hasExisting = !!currentFilters[field];
+  const labelValue = rawValue === null || rawValue === undefined ? "" : String(rawValue);
+
+  const items = [];
+  if (labelValue.trim().length > 0) {
+    items.push({
+      name: `Include \"${labelValue}\"`,
+      action: function () {
+        dagfuncs.applySingleCellFilter(field, labelValue, "include");
+      },
+    });
+    items.push({
+      name: `Exclude \"${labelValue}\"`,
+      action: function () {
+        dagfuncs.applySingleCellFilter(field, labelValue, "exclude");
+      },
+    });
+    items.push("separator");
+  }
+
+  items.push({
+    name: "Edit field filter...",
+    action: function () {
+      if (params && params.column) {
+        dagfuncs.openFieldFilterDialog({ column: params.column });
+      }
+    },
+  });
+
+  if (hasExisting) {
+    items.push({
+      name: "Clear field filter",
+      action: function () {
+        const nextFilters = dagfuncs.readCurrentFilters();
+        delete nextFilters[field];
+        dagfuncs.writeCurrentFilters(nextFilters);
+      },
+    });
+  }
+
+  items.push("separator", ...defaults);
+  return items;
+};
+
 dagfuncs.openIncludeExcludeDialog = function (headerName, defaultInText, defaultOutText) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
@@ -285,7 +429,7 @@ dagfuncs.openIncludeExcludeDialog = function (headerName, defaultInText, default
   });
 };
 
-dagfuncs.onColumnHeaderClicked = async function (params) {
+dagfuncs.openFieldFilterDialog = async function (params) {
   try {
     const column = params && params.column;
     const colDef = column && typeof column.getColDef === "function" ? column.getColDef() : null;
@@ -296,32 +440,12 @@ dagfuncs.onColumnHeaderClicked = async function (params) {
       return;
     }
 
-    const textarea = document.getElementById("server-filter-input");
-    let currentFilters = {};
-
-    if (textarea && textarea.value) {
-      try {
-        const parsed = JSON.parse(textarea.value);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          currentFilters = parsed;
-        }
-      } catch (e) {
-        // Ignore malformed textbox state and start from empty object.
-      }
-    }
+    const currentFilters = dagfuncs.readCurrentFilters();
 
     const existingSpec = currentFilters[field];
-    let existingIn = [];
-    let existingOut = [];
-
-    if (Array.isArray(existingSpec)) {
-      existingIn = existingSpec;
-    } else if (existingSpec && typeof existingSpec === "object") {
-      const maybeIn = existingSpec.in;
-      const maybeOut = existingSpec.not_in;
-      existingIn = Array.isArray(maybeIn) ? maybeIn : (maybeIn ? [maybeIn] : []);
-      existingOut = Array.isArray(maybeOut) ? maybeOut : (maybeOut ? [maybeOut] : []);
-    }
+    const normalized = dagfuncs.normalizeFilterSpec(existingSpec);
+    const existingIn = normalized.existingIn;
+    const existingOut = normalized.existingOut;
 
     const defaultInText = existingIn.join(", ");
     const defaultOutText = existingOut.join(", ");
@@ -367,26 +491,12 @@ dagfuncs.onColumnHeaderClicked = async function (params) {
       currentFilters[field] = spec;
     }
 
-    const pretty = JSON.stringify(currentFilters, null, 2);
-
-    if (window.dash_clientside && typeof window.dash_clientside.set_props === "function") {
-      window.dash_clientside.set_props("server-filter-input", { value: pretty });
-      window.dash_clientside.set_props("manual-filter-store", {
-        data: {
-          timestamp: Date.now(),
-          filters: currentFilters,
-        },
-      });
-      window.dash_clientside.set_props("filter-parse-message", {
-        children: `Applied ${Object.keys(currentFilters).length} filter field(s).`,
-        style: { minWidth: "240px", fontSize: "13px", color: "#065f46" },
-      });
-    }
+    dagfuncs.writeCurrentFilters(currentFilters);
   } catch (e) {
-    console.error("[onColumnHeaderClicked] failed", String(e), e);
+    console.error("[openFieldFilterDialog] failed", String(e), e);
   }
 };
 
 // Expose for AG Grid dashGridOptions callback usage.
 window.onGridFilterChanged = dagfuncs.onGridFilterChanged;
-window.onColumnHeaderClicked = dagfuncs.onColumnHeaderClicked;
+window.getCustomContextMenuItems = dagfuncs.getCustomContextMenuItems;

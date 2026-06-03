@@ -364,6 +364,7 @@ def build_grid_options() -> dict:
         "animateRows": True,
         "rowGroupPanelShow": "always",
         "pivotPanelShow": "always",
+        "getContextMenuItems": {"function": "getCustomContextMenuItems(params)"},
         "groupDisplayType": "multipleColumns",
         "groupDefaultExpanded": -1,
         "groupHideOpenParents": True,
@@ -510,8 +511,13 @@ app.layout = html.Div(
             ],
         ),
         html.Div(
-            "Use Columns panel for drilldown, and the JSON box below for server-side filters.",
+            "Use Columns panel for drilldown. Right-click a data cell for Include/Exclude filter actions.",
             style={"color": "#374151", "marginBottom": "12px"},
+        ),
+        dcc.Textarea(
+            id="server-filter-input",
+            value="{}",
+            style={"display": "none"},
         ),
         html.Div(
             style={
@@ -522,33 +528,76 @@ app.layout = html.Div(
                 "flexWrap": "wrap",
             },
             children=[
-                html.Div(
-                    style={"flex": "1", "minWidth": "340px"},
-                    children=[
-                        html.Div("Server Filters (JSON)", style={"fontWeight": "600", "marginBottom": "6px"}),
-                        dcc.Textarea(
-                            id="server-filter-input",
-                            value="{}",
-                            style={
-                                "width": "100%",
-                                "height": "72px",
-                                "padding": "8px",
-                                "fontFamily": "monospace",
-                                "fontSize": "12px",
-                            },
-                        ),
-                        html.Div(
-                            'Example: {"year": {"in": [2024]}, "region": {"not_in": ["APAC"]}}',
-                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "4px"},
-                        ),
-                    ],
-                ),
-                html.Button("Apply Filters", id="apply-filters-btn", n_clicks=0),
+                html.Button("Open Filter JSON", id="open-filter-json-btn", n_clicks=0),
                 html.Button("Clear Filters", id="clear-filters-btn", n_clicks=0),
                 html.Div(
                     id="filter-parse-message",
                     style={"minWidth": "240px", "fontSize": "13px", "color": "#374151"},
                 ),
+            ],
+        ),
+        html.Div(
+            id="filter-json-modal",
+            style={
+                "display": "none",
+                "position": "fixed",
+                "inset": "0",
+                "background": "rgba(0, 0, 0, 0.35)",
+                "zIndex": 2000,
+                "alignItems": "center",
+                "justifyContent": "center",
+            },
+            children=[
+                html.Div(
+                    style={
+                        "width": "760px",
+                        "maxWidth": "95vw",
+                        "background": "#fff",
+                        "borderRadius": "10px",
+                        "padding": "14px",
+                        "boxSizing": "border-box",
+                        "boxShadow": "0 10px 30px rgba(0, 0, 0, 0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
+                            children=[
+                                html.Div("Server Filters (JSON)", style={"fontWeight": "700"}),
+                                html.Button(
+                                    "X",
+                                    id="close-filter-json-x-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "background": "#fff",
+                                        "borderRadius": "6px",
+                                        "padding": "4px 8px",
+                                        "cursor": "pointer",
+                                        "fontWeight": "700",
+                                    },
+                                ),
+                            ],
+                        ),
+                        dcc.Textarea(
+                            id="server-filter-editor",
+                            value="{}",
+                            readOnly=True,
+                            style={
+                                "width": "100%",
+                                "height": "240px",
+                                "padding": "8px",
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                                "boxSizing": "border-box",
+                                "background": "#f9fafb",
+                            },
+                        ),
+                        html.Div(
+                            'Example: {"year": {"in": [2024]}, "region": {"not_in": ["APAC"]}}',
+                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "6px"},
+                        ),
+                    ],
+                )
             ],
         ),
         html.Div(
@@ -565,7 +614,6 @@ app.layout = html.Div(
                     columnDefs=build_column_defs(initial_df, initial_model, DEFAULT_MODEL_ID),
                     eventListeners={
                         "filterChanged": ["onGridFilterChanged(params)"],
-                        "columnHeaderClicked": ["onColumnHeaderClicked(params)"],
                     },                    
                     dangerously_allow_code=True,
                     defaultColDef={
@@ -586,16 +634,61 @@ app.layout = html.Div(
 
 
 @app.callback(
+    Output("filter-json-modal", "style"),
+    Output("server-filter-editor", "value"),
+    Input("open-filter-json-btn", "n_clicks"),
+    Input("close-filter-json-x-btn", "n_clicks"),
+    State("manual-filter-store", "data"),
+    prevent_initial_call=True,
+)
+def on_filter_json_modal_toggle(open_clicks, close_x_clicks, manual_filter_data):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2000,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    if triggered == "open-filter-json-btn.n_clicks":
+        filters = {}
+        if isinstance(manual_filter_data, dict):
+            candidate = manual_filter_data.get("filters")
+            if isinstance(candidate, dict):
+                filters = candidate
+        return shown, json.dumps(filters, indent=2)
+
+    return hidden, no_update
+
+
+@app.callback(
+    Output("server-filter-input", "value", allow_duplicate=True),
+    Input("clear-filters-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_clear_filters_sync_input(clear_clicks):
+    return "{}"
+
+
+@app.callback(
     Output("manual-filter-store", "data"),
     Output("filter-parse-message", "children"),
     Output("filter-parse-message", "style"),
-    Input("apply-filters-btn", "n_clicks"),
     Input("clear-filters-btn", "n_clicks"),
-    State("server-filter-input", "value"),
+    Input("server-filter-input", "value"),
     State("model-selector", "value"),
     prevent_initial_call=True,
 )
-def on_manual_filter_change(apply_clicks, clear_clicks, filter_text, model_id: str):
+def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
     ctx = dash.callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
 
