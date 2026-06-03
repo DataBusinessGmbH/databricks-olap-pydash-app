@@ -1,0 +1,8 @@
+env:
+  # Table where the models are stored. It has just two fields - ModelName and ModelDefinition
+  - name: 'MODELS_TABLE_CATALOG'
+    value: '<catalog>'
+  - name: 'MODELS_TABLE_SCHEMA'
+    value: 'GOLD'    
+  - name: 'MODELS_TABLE_NAME'
+    value: 'REPORTINGMODELS'
