@@ -14,6 +14,8 @@ DatabricksBackend instantiation for another OlapDatabase implementation.
 from pathlib import Path
 import os
 import json
+import re
+import importlib
 from flask import jsonify, request as flask_request
 
 import dash_ag_grid as dag
@@ -22,7 +24,13 @@ from dash import Dash, Input, Output, State, dcc, html, no_update
 import dash
 
 from src.model import OlapModel, DimensionDef, MetricDef
-from src.db import LOGGER, OlapDatabase, OlapQueryRequest, create_databricks_backend
+from src import db as db_layer
+from src.db import (
+    LOGGER,
+    OlapDatabase,
+    OlapQueryRequest,
+    create_databricks_backend,
+)
 import logging
 
 # ---------------------------------------------------------------------------
@@ -31,7 +39,9 @@ import logging
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
+RUNTIME_MODELS_DIR = BASE_DIR / ".runtime_models"
 DEFAULT_MAX_ROWS = 1000
+STARTUP_WARNINGS: list[str] = []
 
 
 def ensure_logging_visible() -> None:
@@ -78,6 +88,15 @@ def discover_model_files() -> dict[str, Path]:
         for p in sorted(MODELS_DIR.glob("*.y*ml")):
             model_files[p.stem] = p
 
+    table_models = load_models_from_env_table()
+    if table_models:
+        RUNTIME_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        for model_name, model_yaml in table_models.items():
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", model_name).strip("._-") or "model"
+            model_path = RUNTIME_MODELS_DIR / f"{safe_stem}.yaml"
+            model_path.write_text(model_yaml, encoding="utf-8")
+            model_files[model_name] = model_path
+
     if not model_files:
         raise FileNotFoundError(
             "No model YAML found. Add one under models/*.yaml."
@@ -86,6 +105,104 @@ def discover_model_files() -> dict[str, Path]:
     LOGGER.info(f"Discovered model files: {model_files}")
 
     return model_files
+
+
+def _quoted_ident(name: str) -> str:
+    return "`" + str(name).replace("`", "``") + "`"
+
+
+def _run_startup_sql(sql: str) -> pd.DataFrame:
+    cfg = db_layer.load_databricks_config_from_env()
+
+    if cfg.mode == "sql":
+        missing = [
+            key
+            for key, value in {
+                "DATABRICKS_SERVER_HOSTNAME": cfg.server_hostname,
+                "DATABRICKS_HTTP_PATH": cfg.http_path,
+                "DATABRICKS_TOKEN": cfg.access_token,
+            }.items()
+            if not value
+        ]
+        if missing:
+            LOGGER.warning("Skipping models table lookup (missing SQL env vars): %s", ", ".join(missing))
+            return pd.DataFrame()
+
+        sql_mod = importlib.import_module("databricks.sql")
+        conn = sql_mod.connect(
+            server_hostname=cfg.server_hostname,
+            http_path=cfg.http_path,
+            access_token=cfg.access_token,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(rows, columns=cols)
+        finally:
+            conn.close()
+
+    db_connect = importlib.import_module("databricks.connect")
+    spark = db_connect.DatabricksSession.builder.serverless().getOrCreate()
+    return spark.sql(sql).toPandas()
+
+
+def load_models_from_env_table() -> dict[str, str]:
+    """
+    Load models from the environment-configured table if configured.
+
+    Expected columns:
+      - ModelName
+      - ModelDefinition
+    """
+    catalog = os.getenv("MODELS_TABLE_CATALOG")
+    schema = os.getenv("MODELS_TABLE_SCHEMA")
+    table = os.getenv("MODELS_TABLE_NAME")
+
+    if not (catalog and schema and table):
+        LOGGER.info("Model_table_catalog = %s, Model_table_schema = %s, Model_table_name = %s", catalog, schema, table)        
+        LOGGER.info("Models table env vars not fully set; skipping table model discovery.")
+        return {}
+
+    qualified = ".".join([_quoted_ident(catalog), _quoted_ident(schema), _quoted_ident(table)])
+    sql = f"SELECT * FROM {qualified}"
+
+    try:
+        df = _run_startup_sql(sql)
+    except Exception:
+        STARTUP_WARNINGS.append(
+            f"Configured models table {catalog}.{schema}.{table} was not found or could not be read. Continuing with local model files."
+        )
+        LOGGER.info("Failed reading models from table %s; continuing with local model files.", qualified)
+        return {}
+
+    if df.empty:
+        LOGGER.info("No rows found in models table %s", qualified)
+        return {}
+
+    lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
+    name_col = lower_to_actual.get("modelname")
+    def_col = lower_to_actual.get("modeldefinition")
+
+    if not name_col or not def_col:
+        LOGGER.warning(
+            "Models table %s missing expected columns ModelName/ModelDefinition. Found: %s",
+            qualified,
+            list(df.columns),
+        )
+        return {}
+
+    models: dict[str, str] = {}
+    for _, row in df.iterrows():
+        model_name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
+        model_def = str(row[def_col]).strip() if pd.notna(row[def_col]) else ""
+        if not model_name or not model_def:
+            continue
+        models[model_name] = model_def
+
+    LOGGER.info("Loaded %s model definition(s) from table %s", len(models), qualified)
+    return models
 
 
 MODEL_FILES = discover_model_files()
@@ -201,6 +318,41 @@ def get_allowed_filter_fields(model: OlapModel) -> set[str]:
     return fields
 
 
+def get_dimension_filter_fields(model: OlapModel) -> list[str]:
+    fields: set[str] = set()
+    for dim in model.dimensions:
+        fields.add(dim.dim_key)
+        fields.add(dim.display_key)
+        for attr in dim.attributes:
+            fields.add(attr.name)
+    return sorted(fields)
+
+
+def get_dimension_dropdown_options(model_id: str) -> list[dict[str, str]]:
+    model = get_model(model_id)
+    return [{"label": dim.name, "value": dim.name} for dim in model.dimensions]
+
+
+def get_field_filter_dropdown_options(model_id: str, dimension_name: str | None) -> list[dict[str, str]]:
+    model = get_model(model_id)
+    if not dimension_name:
+        return []
+
+    dim = next((d for d in model.dimensions if d.name == dimension_name), None)
+    if dim is None:
+        return []
+
+    options: list[dict[str, str]] = [{"label": "Key", "value": dim.dim_key}]
+    for attr in dim.attributes:
+        options.append({"label": attr.label, "value": attr.name})
+    return options
+
+
+def _split_csv_values(value: str | None) -> list[str]:
+    parts = [p.strip() for p in (value or "").split(",")]
+    return [p for p in parts if p]
+
+
 def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dict[str, dict[str, list]], str | None]:
     text = (filter_text or "").strip()
     if not text:
@@ -259,6 +411,22 @@ def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dic
 
 def filter_button_label(filter_count: int) -> str:
     return f"Applied filters ({filter_count})"
+
+
+def startup_warning_style(hidden: bool) -> dict[str, str]:
+    return {
+        "display": "none" if hidden else "flex",
+        "justifyContent": "space-between",
+        "alignItems": "flex-start",
+        "gap": "12px",
+        "background": "#fffbeb",
+        "border": "1px solid #f59e0b",
+        "color": "#92400e",
+        "padding": "10px 12px",
+        "borderRadius": "8px",
+        "marginBottom": "12px",
+        "fontSize": "13px",
+    }
 
 # ---------------------------------------------------------------------------
 # Grid column-definition builders  (driven entirely by the model)
@@ -458,6 +626,28 @@ app.layout = html.Div(
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
         dcc.Store(id="manual-filter-store", data={"timestamp": 0, "filters": {}}),
         html.Div(
+            id="startup-warning-banner",
+            children=[
+                html.Div([html.Div(msg) for msg in STARTUP_WARNINGS], style={"flex": "1"}),
+                html.Button(
+                    "X",
+                    id="dismiss-startup-warning-btn",
+                    n_clicks=0,
+                    style={
+                        "border": "1px solid #f59e0b",
+                        "background": "#fff7ed",
+                        "color": "#92400e",
+                        "borderRadius": "6px",
+                        "padding": "2px 8px",
+                        "cursor": "pointer",
+                        "fontWeight": "700",
+                        "lineHeight": "1.2",
+                    },
+                ),
+            ],
+            style=startup_warning_style(hidden=not STARTUP_WARNINGS),
+        ),
+        html.Div(
             style={
                 "display": "flex",
                 "justifyContent": "space-between",
@@ -538,6 +728,102 @@ app.layout = html.Div(
                             },
                         ),
                     ],
+                ),
+            ],
+        ),
+        html.Div(
+            style={
+                "marginBottom": "10px",
+                "display": "flex",
+                "gap": "16px",
+                "alignItems": "end",
+                "flexWrap": "wrap",
+            },
+            children=[
+                html.Div(
+                    style={"minWidth": "240px", "maxWidth": "280px"},
+                    children=[
+                        html.Div("Dimension", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="field-filter-dimension-selector",
+                            options=get_dimension_dropdown_options(DEFAULT_MODEL_ID),
+                            value=(get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None),
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"minWidth": "240px", "maxWidth": "280px"},
+                    children=[
+                        html.Div("Attribute", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="field-filter-selector",
+                            options=get_field_filter_dropdown_options(
+                                DEFAULT_MODEL_ID,
+                                get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
+                            ),
+                            value=(
+                                get_field_filter_dropdown_options(
+                                    DEFAULT_MODEL_ID,
+                                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
+                                )[0]["value"]
+                                if get_field_filter_dropdown_options(
+                                    DEFAULT_MODEL_ID,
+                                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
+                                )
+                                else None
+                            ),
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"minWidth": "240px", "paddingRight": "16px"},
+                    children=[
+                        html.Div("Include values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Input(
+                            id="field-filter-include-input",
+                            type="text",
+                            placeholder="e.g. 2024, 2025",
+                            debounce=True,
+                            style={"width": "100%", "padding": "8px"},
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"minWidth": "240px", "paddingRight": "16px"},
+                    children=[
+                        html.Div("Exclude values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Input(
+                            id="field-filter-exclude-input",
+                            type="text",
+                            placeholder="e.g. APAC",
+                            debounce=True,
+                            style={"width": "100%", "padding": "8px"},
+                        ),
+                    ],
+                ),
+                html.Button(
+                    "Set Filter",
+                    id="apply-field-filter-btn",
+                    n_clicks=0,
+                    style={
+                        "height": "38px",
+                        "padding": "0 14px",
+                        "background": "#f3f4f6",
+                        "border": "1px solid #d1d5db",
+                    },
+                ),
+                html.Button(
+                    "Clear Filter",
+                    id="clear-field-filter-btn",
+                    n_clicks=0,
+                    style={
+                        "height": "38px",
+                        "padding": "0 14px",
+                        "background": "#f3f4f6",
+                        "border": "1px solid #d1d5db",
+                    },
                 ),
             ],
         ),
@@ -691,6 +977,93 @@ def on_filter_json_modal_toggle(open_clicks, close_x_clicks, manual_filter_data)
 )
 def on_clear_filters_sync_input(clear_clicks):
     return "{}"
+
+
+@app.callback(
+    Output("field-filter-dimension-selector", "options"),
+    Output("field-filter-dimension-selector", "value"),
+    Output("field-filter-selector", "options"),
+    Output("field-filter-selector", "value"),
+    Input("model-selector", "value"),
+    Input("field-filter-dimension-selector", "value"),
+    State("field-filter-selector", "value"),
+)
+def on_model_or_dimension_change_update_field_filter_options(
+    model_id: str,
+    current_dimension: str | None,
+    current_field: str | None,
+):
+    dim_options = get_dimension_dropdown_options(model_id)
+    dim_values = {o["value"] for o in dim_options}
+    next_dimension = current_dimension if current_dimension in dim_values else (dim_options[0]["value"] if dim_options else None)
+
+    field_options = get_field_filter_dropdown_options(model_id, next_dimension)
+    field_values = {o["value"] for o in field_options}
+    next_field = current_field if current_field in field_values else (field_options[0]["value"] if field_options else None)
+    return dim_options, next_dimension, field_options, next_field
+
+
+@app.callback(
+    Output("server-filter-input", "value", allow_duplicate=True),
+    Input("apply-field-filter-btn", "n_clicks"),
+    Input("clear-field-filter-btn", "n_clicks"),
+    State("field-filter-selector", "value"),
+    State("field-filter-include-input", "value"),
+    State("field-filter-exclude-input", "value"),
+    State("server-filter-input", "value"),
+    prevent_initial_call=True,
+)
+def on_field_filter_apply_or_clear(
+    apply_clicks,
+    clear_clicks,
+    field_name,
+    include_csv,
+    exclude_csv,
+    current_filter_json,
+):
+    if not field_name:
+        return no_update
+
+    try:
+        current = json.loads((current_filter_json or "{}").strip())
+        if not isinstance(current, dict):
+            current = {}
+    except Exception:
+        current = {}
+
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    if triggered == "clear-field-filter-btn.n_clicks":
+        current.pop(field_name, None)
+        return json.dumps(current, indent=2)
+
+    include_vals = _split_csv_values(include_csv)
+    exclude_vals = _split_csv_values(exclude_csv)
+
+    include_set = set(include_vals)
+    exclude_vals = [v for v in exclude_vals if v not in include_set]
+
+    if not include_vals and not exclude_vals:
+        current.pop(field_name, None)
+    else:
+        spec: dict[str, list[str]] = {}
+        if include_vals:
+            spec["in"] = include_vals
+        if exclude_vals:
+            spec["not_in"] = exclude_vals
+        current[field_name] = spec
+
+    return json.dumps(current, indent=2)
+
+
+@app.callback(
+    Output("startup-warning-banner", "style"),
+    Input("dismiss-startup-warning-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_dismiss_startup_warning(n_clicks):
+    return startup_warning_style(hidden=True)
 
 
 @app.callback(
