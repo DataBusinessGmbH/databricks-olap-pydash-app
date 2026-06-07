@@ -176,6 +176,38 @@ dagfuncs.onGridFilterChanged = function (params) {
   }
 };
 
+dagfuncs.onGridColumnStateChanged = function (params) {
+  console.info("[onGridColumnStateChanged] FIRED", { params });
+  try {
+    const columnState =
+      params && params.columnApi && typeof params.columnApi.getColumnState === "function"
+        ? params.columnApi.getColumnState() || []
+        : params && params.api && typeof params.api.getColumnState === "function"
+          ? params.api.getColumnState() || []
+          : [];
+
+    console.info("[onGridColumnStateChanged] extracted columnState", {
+      columnState,
+      timestamp: Date.now(),
+    });
+
+    if (window.dash_clientside && typeof window.dash_clientside.set_props === "function") {
+      console.info("[onGridColumnStateChanged] updating column-change-trigger via dash_clientside.set_props");
+      window.dash_clientside.set_props("column-change-trigger", {
+        data: {
+          timestamp: Date.now(),
+          columnState: columnState,
+        },
+      });
+      return;
+    }
+
+    console.warn("[onGridColumnStateChanged] dash_clientside.set_props not available");
+  } catch (e) {
+    console.error("[onGridColumnStateChanged] failed", String(e), e);
+  }
+};
+
 dagfuncs.readCurrentFilters = function () {
   const textarea = document.getElementById("server-filter-input");
   if (!textarea || !textarea.value) {
@@ -766,4 +798,5 @@ dagfuncs.installFieldLookupHotkey();
 
 // Expose for AG Grid dashGridOptions callback usage.
 window.onGridFilterChanged = dagfuncs.onGridFilterChanged;
+window.onGridColumnStateChanged = dagfuncs.onGridColumnStateChanged;
 window.getCustomContextMenuItems = dagfuncs.getCustomContextMenuItems;

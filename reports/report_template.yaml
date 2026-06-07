@@ -1,0 +1,45 @@
+# Report definition template
+# Place report YAML files in this folder. Each file becomes one selectable report.
+name: Sales by Region
+
+# Option A: Bind explicitly to a generated model id (preferred when known)
+# model_id: metricview_gold_fact_sales
+
+# Option B: Bind by metric-view identity in the selected namespace
+catalog: testdata
+schema: gold
+metric_view: mv_sales
+
+# Default dimensions (optional flat row fields)
+# Use model field names (dimension key or attributes)
+dimensions:
+  - dim_customer
+  - dim_product
+
+# Preferred: fields to show for each dimension
+# Keys can be dimension display name (for example "Customer") or table name alias.
+# The dimension key is automatically added when dimension_fields is used.
+dimension_fields:
+  dim_customer:
+    - customer_name
+  dim_product:
+    - category
+    - brand
+
+# Default key figures (metrics) to show
+# Supported forms:
+#   - m_sales_amount
+#   - name: m_sales_amount
+#   - SUM(MEASURE(`Sales Amount`))
+#   - MEASURE(`Sales Amount`)
+# Note: report-level aggregation is ignored; aggregation is defined by metric view.
+keyfigures:
+  - MEASURE(`Sales Amount`)
+  - MEASURE(`Count`)
+
+# Default filters applied by report
+filters:
+  region:
+    not_in: [AMER, LATAM]
+  segment:
+    not_in: [Xyz]

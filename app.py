@@ -16,6 +16,8 @@ import os
 import json
 import re
 import importlib
+import functools
+from typing import Any
 from flask import jsonify, request as flask_request
 
 import dash_ag_grid as dag
@@ -23,7 +25,7 @@ import pandas as pd
 from dash import Dash, Input, Output, State, dcc, html, no_update
 import dash
 
-from src.model import OlapModel, DimensionDef, MetricDef
+from src.model import MetricViewDef, MvField
 from src import db as db_layer
 from src.db import (
     LOGGER,
@@ -38,10 +40,11 @@ import logging
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
-RUNTIME_MODELS_DIR = BASE_DIR / ".runtime_models"
+REPORTS_DIR = BASE_DIR / "reports"
 DEFAULT_MAX_ROWS = 1000
 STARTUP_WARNINGS: list[str] = []
+# In-memory model registry: model_id → MetricViewDef
+METRIC_VIEW_REGISTRY: dict[str, MetricViewDef] = {}
 
 
 def ensure_logging_visible() -> None:
@@ -80,35 +83,878 @@ def load_env_on_startup() -> None:
 load_env_on_startup()
 
 
-def discover_model_files() -> dict[str, Path]:
-    """Return {model_id: model_yaml_path} for all available model YAML files."""
-    model_files: dict[str, Path] = {}
+def _safe_model_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or "")).strip("._-")
 
-    if MODELS_DIR.exists():
-        for p in sorted(MODELS_DIR.glob("*.y*ml")):
-            model_files[p.stem] = p
 
-    table_models = load_models_from_env_table()
-    if table_models:
-        RUNTIME_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        for model_name, model_yaml in table_models.items():
-            safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", model_name).strip("._-") or "model"
-            model_path = RUNTIME_MODELS_DIR / f"{safe_stem}.yaml"
-            model_path.write_text(model_yaml, encoding="utf-8")
-            model_files[model_name] = model_path
+def metric_view_model_id(catalog: str, schema: str, metric_view_name: str) -> str:
+    safe_catalog = _safe_model_token(catalog) or "catalog"
+    safe_stem = _safe_model_token(metric_view_name) or "metricview"
+    safe_schema = _safe_model_token(schema) or "schema"
+    return f"metricview_{safe_catalog}_{safe_schema}_{safe_stem}"
 
-    if not model_files:
-        raise FileNotFoundError(
-            "No model YAML found. Add one under models/*.yaml."
-        )
-    
-    LOGGER.info(f"Discovered model files: {model_files}")
 
-    return model_files
+def register_metric_views(catalog: str, schema: str) -> dict[str, str]:
+    """Discover, parse, and register all metric views for catalog/schema into METRIC_VIEW_REGISTRY."""
+    model_ids: dict[str, str] = {}  # model_id → metric_view_name
+
+    mv_defs = load_metric_views(catalog, schema)
+    for mv_name, mv_def in mv_defs.items():
+        model_id = mv_def.model_id
+
+        if model_id in model_ids or model_id in METRIC_VIEW_REGISTRY:
+            suffix = 1
+            unique_id = f"{model_id}_{suffix}"
+            while unique_id in model_ids or unique_id in METRIC_VIEW_REGISTRY:
+                suffix += 1
+                unique_id = f"{model_id}_{suffix}"
+            STARTUP_WARNINGS.append(
+                f"Metric view model id conflict for {model_id}; registered as {unique_id}."
+            )
+            model_id = unique_id
+            mv_def = MetricViewDef(
+                model_id=model_id,
+                catalog=mv_def.catalog,
+                schema=mv_def.schema,
+                metric_view_name=mv_def.metric_view_name,
+                display_name=mv_def.display_name,
+                fields=mv_def.fields,
+            )
+
+        METRIC_VIEW_REGISTRY[model_id] = mv_def
+        model_ids[model_id] = mv_name
+
+    if not model_ids:
+        LOGGER.info("No metric views registered in %s.%s", catalog, schema)
+    LOGGER.info("Registered metric views for %s.%s: %s", catalog, schema, model_ids)
+    return model_ids
 
 
 def _quoted_ident(name: str) -> str:
     return "`" + str(name).replace("`", "``") + "`"
+
+
+def _extract_first_non_null_str(df: pd.DataFrame) -> list[str]:
+    values: list[str] = []
+    if df.empty:
+        return values
+
+    for col in df.columns:
+        for raw in df[col].tolist():
+            if pd.isna(raw):
+                continue
+            text = str(raw).strip()
+            if text:
+                values.append(text)
+        if values:
+            return values
+    return values
+
+
+def _parse_csv_env(var_name: str) -> list[str]:
+    raw = (os.getenv(var_name) or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
+def _exclude_information_schema(names: list[str]) -> list[str]:
+    return [n for n in names if str(n).strip().lower() != "information_schema"]
+
+
+def _exclude_non_reporting_schemas(names: list[str]) -> list[str]:
+    excluded = {"information_schema", "default"}
+    return [n for n in names if str(n).strip().lower() not in excluded]
+
+
+def _normalize_report_filters(raw_filters) -> dict[str, dict[str, list] | list]:
+    if not isinstance(raw_filters, dict):
+        return {}
+    parsed: dict[str, dict[str, list] | list] = {}
+    for field, spec in raw_filters.items():
+        if isinstance(spec, dict):
+            includes = spec.get("in", [])
+            excludes = spec.get("not_in", [])
+            includes = includes if isinstance(includes, list) else [includes]
+            excludes = excludes if isinstance(excludes, list) else [excludes]
+            filter_spec: dict[str, list] = {}
+            in_clean = [v for v in includes if v not in (None, "")]
+            not_in_clean = [v for v in excludes if v not in (None, "")]
+            if in_clean:
+                filter_spec["in"] = in_clean
+            if not_in_clean:
+                filter_spec["not_in"] = not_in_clean
+            if filter_spec:
+                parsed[str(field)] = filter_spec
+            continue
+
+        values = spec if isinstance(spec, list) else [spec]
+        values = [v for v in values if v not in (None, "")]
+        if values:
+            parsed[str(field)] = {"in": values}
+    return parsed
+
+
+def _normalize_report_dimension_fields(raw_dimension_fields) -> dict[str, list[str]]:
+    if not isinstance(raw_dimension_fields, dict):
+        return {}
+
+    parsed: dict[str, list[str]] = {}
+    for dim_name, fields in raw_dimension_fields.items():
+        if fields is None:
+            continue
+        values = fields if isinstance(fields, list) else [fields]
+        cleaned = [str(v).strip() for v in values if str(v).strip()]
+        if cleaned:
+            parsed[str(dim_name).strip()] = cleaned
+    return parsed
+
+"""
+def _normalize_aggregation_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    agg = str(value).strip().lower()
+    return agg if agg else None
+"""
+
+def _parse_keyfigure_expr(value: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    # Convention: SUM(MEASURE(`Sales net`)) or MEASURE(`Sales net`).
+    # The outer aggregation function (if present) is intentionally ignored,
+    # because aggregation semantics come from the metric view.
+    match_nested = re.fullmatch(
+        r"(?i)\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\s*MEASURE\s*\(\s*`([^`]+)`\s*\)\s*\)\s*",
+        text,
+    )
+    if match_nested:
+        measure_ref = str(match_nested.group(1)).strip()
+        return measure_ref or None
+
+    match = re.fullmatch(
+        r"(?i)\s*MEASURE\s*\(\s*`([^`]+)`\s*\)\s*",
+        text,
+    )
+    if not match:
+        return None
+
+    measure_ref = str(match.group(1)).strip()
+    return measure_ref or None
+
+
+def load_report_definitions() -> dict[str, dict[str, Any]]:
+    reports: dict[str, dict[str, Any]] = {}
+    if not REPORTS_DIR.exists():
+        return reports
+
+    for path in sorted(REPORTS_DIR.glob("*.y*ml")):
+        report_id = path.stem
+        try:
+            raw = _yaml_safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            STARTUP_WARNINGS.append(f"Failed reading report YAML {path.name}; skipping.")
+            continue
+
+        if not isinstance(raw, dict):
+            STARTUP_WARNINGS.append(f"Report file {path.name} must contain a YAML object.")
+            continue
+
+        name = str(raw.get("name") or raw.get("title") or report_id)
+        dimensions_raw = raw.get("dimensions", raw.get("rows", []))
+        dimensions: list[str] = []
+        dimension_fields_raw = raw.get("dimension_fields", {})
+
+        if isinstance(dimensions_raw, list):
+            for entry in dimensions_raw:
+                if isinstance(entry, str):
+                    dimensions.append(entry)
+                    continue
+                if isinstance(entry, dict):
+                    dim_name = str(entry.get("name") or "").strip()
+                    if dim_name:
+                        dimensions.append(dim_name)
+                        if "fields" in entry and dim_name not in dimension_fields_raw:
+                            dimension_fields_raw[dim_name] = entry.get("fields")
+
+        keyfigures = raw.get("keyfigures", raw.get("metrics", []))
+        report_def: dict[str, Any] = {
+            "id": report_id,
+            "name": name,
+            "model_id": raw.get("model_id"),
+            "catalog": raw.get("catalog"),
+            "schema": raw.get("schema"),
+            "metric_view": raw.get("metric_view"),
+            "dimensions": dimensions,
+            "dimension_fields": _normalize_report_dimension_fields(dimension_fields_raw),
+            "keyfigures": keyfigures if isinstance(keyfigures, list) else [],
+            "filters": _normalize_report_filters(raw.get("filters", {})),
+        }
+        reports[report_id] = report_def
+
+    LOGGER.info("Loaded %s report definition(s) from %s", len(reports), REPORTS_DIR)
+    return reports
+
+
+def resolve_report_model_id(report: dict[str, Any], catalog: str, schema: str) -> str | None:
+    model_id = str(report.get("model_id") or "").strip()
+    if model_id:
+        return model_id
+
+    report_catalog = str(report.get("catalog") or "").strip()
+    if report_catalog and report_catalog != catalog:
+        return None
+
+    metric_view = str(report.get("metric_view") or "").strip()
+    if not metric_view:
+        return None
+
+    report_schema = str(report.get("schema") or schema).strip()
+    if not report_schema:
+        return None
+
+    return metric_view_model_id(catalog, report_schema, metric_view)
+
+
+def _build_access_matrix() -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+
+    for catalog in list_catalog_names():
+        for schema in list_schema_names(catalog):
+            model_map = register_metric_views(catalog, schema)
+            for model_id, metric_view_name in model_map.items():
+                rows.append(
+                    {
+                        "catalog": catalog,
+                        "schema": schema,
+                        "model_id": model_id,
+                        "metric_view": metric_view_name,
+                        "report_id": "__no_report__",
+                        "report_name": "No Report",
+                    }
+                )
+
+                for report_id, report in REPORT_DEFS.items():
+                    resolved_model = resolve_report_model_id(report, catalog, schema)
+                    if resolved_model == model_id:
+                        rows.append(
+                            {
+                                "catalog": catalog,
+                                "schema": schema,
+                                "model_id": model_id,
+                                "metric_view": metric_view_name,
+                                "report_id": report_id,
+                                "report_name": str(report.get("name") or report_id),
+                            }
+                        )
+
+    access_df = pd.DataFrame(rows, columns=["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"])
+    return access_df
+
+
+def _unique_options(df: pd.DataFrame, value_col: str) -> list[dict[str, str]]:
+    if df.empty:
+        return []
+    deduped = (
+        df[[value_col]]
+        .dropna(subset=[value_col])
+        .drop_duplicates(subset=[value_col], keep="first")
+        .sort_values(by=[value_col])
+    )
+    return [{"label": str(row[value_col]), "value": str(row[value_col])} for _, row in deduped.iterrows()]
+
+
+def get_catalog_dropdown_options_from_matrix() -> list[dict[str, str]]:
+    if ACCESS_MATRIX_DF.empty:
+        return [{"label": c, "value": c} for c in list_catalog_names()]
+    return _unique_options(ACCESS_MATRIX_DF, "catalog")
+
+
+def get_schema_dropdown_options_from_matrix(catalog: str | None) -> list[dict[str, str]]:
+    if not catalog or ACCESS_MATRIX_DF.empty:
+        return []
+    scoped = ACCESS_MATRIX_DF[ACCESS_MATRIX_DF["catalog"] == str(catalog)]
+    return _unique_options(scoped, "schema")
+
+
+def get_all_schema_dropdown_options_from_matrix() -> list[dict[str, str]]:
+    if ACCESS_MATRIX_DF.empty:
+        return []
+    return _unique_options(ACCESS_MATRIX_DF, "schema")
+
+
+def get_model_dropdown_options_from_matrix(catalog: str | None, schema: str | None) -> list[dict[str, str]]:
+    if not catalog or not schema or ACCESS_MATRIX_DF.empty:
+        return []
+    scoped = ACCESS_MATRIX_DF[
+        (ACCESS_MATRIX_DF["catalog"] == str(catalog))
+        & (ACCESS_MATRIX_DF["schema"] == str(schema))
+    ]
+    if scoped.empty:
+        return []
+
+    deduped = (
+        scoped[["model_id", "metric_view"]]
+        .dropna(subset=["model_id"])
+        .drop_duplicates(subset=["model_id"], keep="first")
+        .sort_values(by=["metric_view", "model_id"])
+    )
+    return [
+        {
+            "label": str(row["metric_view"]) if pd.notna(row["metric_view"]) and str(row["metric_view"]).strip() else str(row["model_id"]),
+            "value": str(row["model_id"]),
+        }
+        for _, row in deduped.iterrows()
+    ]
+
+
+def get_all_model_dropdown_options_from_matrix() -> list[dict[str, str]]:
+    if ACCESS_MATRIX_DF.empty:
+        return []
+    deduped = (
+        ACCESS_MATRIX_DF[["model_id", "metric_view"]]
+        .dropna(subset=["model_id"])
+        .drop_duplicates(subset=["model_id"], keep="first")
+        .sort_values(by=["metric_view", "model_id"])
+    )
+    return [
+        {
+            "label": str(row["metric_view"]) if pd.notna(row["metric_view"]) and str(row["metric_view"]).strip() else str(row["model_id"]),
+            "value": str(row["model_id"]),
+        }
+        for _, row in deduped.iterrows()
+    ]
+
+
+def get_report_dropdown_options(model_id: str, catalog: str | None, schema: str | None) -> list[dict[str, str]]:
+    if not model_id or not catalog or not schema or ACCESS_MATRIX_DF.empty:
+        return []
+
+    scoped = ACCESS_MATRIX_DF[
+        (ACCESS_MATRIX_DF["catalog"] == str(catalog))
+        & (ACCESS_MATRIX_DF["schema"] == str(schema))
+        & (ACCESS_MATRIX_DF["model_id"] == str(model_id))
+    ]
+    return _unique_options(scoped, "report_id")
+
+
+def _report_request(
+    mv_def: MetricViewDef,
+    report: dict[str, Any],
+    max_rows: int | None,
+    column_state: list[dict[str, Any]] | None = None,
+    extra_filters: dict[str, dict[str, list] | list] | None = None,
+) -> OlapQueryRequest:
+    all_dim_names = {f.name for f in mv_def.dimension_fields}
+    all_measure_names = {f.name for f in mv_def.measures}
+    measure_by_lower = {f.name.lower(): f.name for f in mv_def.measures}
+    measure_label_by_lower = {f.label.lower(): f.name for f in mv_def.measures if f.label}
+
+    def _norm_token(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    # Build group lookups so report YAML can reference dimensions by
+    # display name ("Dim Customer") or alias-like names ("dim_customer").
+    groups_by_name: dict[str, list[str]] = {}
+    group_key_field: dict[str, str] = {}
+    group_name_by_norm: dict[str, str] = {}
+    for f in mv_def.dimension_fields:
+        groups_by_name.setdefault(f.group_name, []).append(f.name)
+        if f.field_type == "dimension_key" and f.group_name not in group_key_field:
+            group_key_field[f.group_name] = f.name
+        group_name_by_norm.setdefault(_norm_token(f.group_name), f.group_name)
+
+    def _resolve_group_name(raw_name: str) -> str | None:
+        key = _norm_token(raw_name)
+        if not key:
+            return None
+        if key in group_name_by_norm:
+            return group_name_by_norm[key]
+        # Fallback: match by normalized field name to infer its group.
+        for f in mv_def.dimension_fields:
+            if _norm_token(f.name) == key:
+                return f.group_name
+        return None
+
+    if column_state:
+        request = build_request_from_grid_state(column_state, max_rows)
+        rows = list(request.rows or [])
+        metrics = list(request.metrics or [])
+    else:
+        # Prefer explicit report.dimension_fields when initializing from report.
+        rows = []
+
+        # Per-group field lists from report.dimension_fields.
+        # Keys may be UI group labels ("Dim Customer") or aliases ("dim_customer").
+        by_dimension = report.get("dimension_fields") or {}
+        if isinstance(by_dimension, dict):
+            for group_name, configured_fields in by_dimension.items():
+                if not isinstance(configured_fields, list):
+                    continue
+
+                resolved_group = _resolve_group_name(str(group_name))
+                valid = set(groups_by_name.get(resolved_group or "", []))
+
+                for field in configured_fields:
+                    if not isinstance(field, str):
+                        continue
+                    field_name = field.strip()
+                    if not field_name or field_name not in all_dim_names:
+                        continue
+
+                    # If group resolved, keep fields within that group.
+                    if valid and field_name not in valid:
+                        continue
+
+                    rows.append(field_name)
+
+        # Backward-compatible fallback: if no dimension_fields are configured,
+        # derive rows from report.dimensions.
+        if not rows:
+            for raw_dim in (report.get("dimensions") or []):
+                if not isinstance(raw_dim, str):
+                    continue
+
+                dim_name = raw_dim.strip()
+                if not dim_name:
+                    continue
+
+                if dim_name in all_dim_names:
+                    rows.append(dim_name)
+                    continue
+
+                resolved_group = _resolve_group_name(dim_name)
+                if not resolved_group:
+                    continue
+
+                group_fields = groups_by_name.get(resolved_group, [])
+                first_non_key = next(
+                    (
+                        f.name
+                        for f in mv_def.dimension_fields
+                        if f.group_name == resolved_group and f.field_type != "dimension_key"
+                    ),
+                    None,
+                )
+                if first_non_key:
+                    rows.append(first_non_key)
+                elif group_fields:
+                    rows.append(group_fields[0])
+
+        rows = list(dict.fromkeys(rows))
+
+        # Metrics / keyfigures
+        metrics = []
+        for entry in (report.get("keyfigures") or []):
+            metric_name: str | None = None
+            if isinstance(entry, str):
+                parsed = _parse_keyfigure_expr(entry)
+                ref = parsed if parsed else entry
+                metric_name = (
+                    ref if ref in all_measure_names
+                    else measure_by_lower.get(ref.lower())
+                    or measure_label_by_lower.get(ref.lower())
+                )
+            elif isinstance(entry, dict):
+                raw_name = str(entry.get("name") or entry.get("metric") or "").strip()
+                metric_name = (
+                    raw_name if raw_name in all_measure_names
+                    else measure_by_lower.get(raw_name.lower())
+                    or measure_label_by_lower.get(raw_name.lower())
+                )
+            if metric_name and metric_name not in metrics:
+                metrics.append(metric_name)
+
+    # Filters
+    all_filterable = mv_def.all_field_names
+    filters: dict[str, dict[str, list] | list] = {
+        field: spec
+        for field, spec in (report.get("filters") or {}).items()
+        if field in all_filterable
+    }
+
+    if isinstance(extra_filters, dict):
+        for field, spec in extra_filters.items():
+            if field in all_filterable:
+                filters[field] = spec
+
+    return OlapQueryRequest(rows=rows, metrics=metrics, filters=filters, max_rows=max_rows)
+
+
+def list_catalog_names() -> list[str]:
+    configured_catalogs = _parse_csv_env("DATABRICKS_REPORTING_CATALOGS")
+    if configured_catalogs:
+        filtered = _exclude_information_schema(configured_catalogs)
+        LOGGER.info("Using configured reporting catalogs from env: %s", filtered)
+        return filtered
+
+    queries = [
+        "SHOW CATALOGS",
+        "SELECT catalog_name FROM system.information_schema.catalogs",
+    ]
+
+    for sql in queries:
+        try:
+            df = _run_startup_sql(sql)
+        except Exception:
+            LOGGER.info("Catalog listing query failed: %s", sql)
+            continue
+
+        names = sorted(set(_exclude_information_schema(_extract_first_non_null_str(df))))
+        if names:
+            return names
+
+    return []
+
+
+def list_schema_names(catalog: str) -> list[str]:
+    namespace = _qualified_ident(catalog)
+    queries = [
+        f"SHOW SCHEMAS IN {namespace}",
+        (
+            "SELECT schema_name "
+            f"FROM {_qualified_ident(catalog, 'information_schema', 'schemata')}"
+        ),
+    ]
+
+    for sql in queries:
+        try:
+            df = _run_startup_sql(sql)
+        except Exception:
+            LOGGER.info("Schema listing query failed for %s: %s", catalog, sql)
+            continue
+
+        if df.empty:
+            continue
+
+        lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
+        preferred = [
+            lower_to_actual.get("database_name"),
+            lower_to_actual.get("namespace"),
+            lower_to_actual.get("schema_name"),
+        ]
+        names: list[str] = []
+        for col in preferred:
+            if col:
+                names.extend(
+                    str(v).strip()
+                    for v in df[col].tolist()
+                    if pd.notna(v) and str(v).strip()
+                )
+                if names:
+                    break
+
+        if not names:
+            names = _extract_first_non_null_str(df)
+
+        names = _exclude_non_reporting_schemas(names)
+
+        if names:
+            return sorted(set(names))
+
+    return []
+
+
+def get_catalog_dropdown_options() -> list[dict[str, str]]:
+    return [{"label": name, "value": name} for name in list_catalog_names()]
+
+
+def get_schema_dropdown_options(catalog: str | None) -> list[dict[str, str]]:
+    if not catalog:
+        return []
+    return [{"label": name, "value": name} for name in list_schema_names(catalog)]
+
+
+def _qualified_ident(*parts: str | None) -> str:
+    return ".".join(_quoted_ident(p) for p in parts if p)
+
+
+def _parse_qualified_name(value: str) -> tuple[str | None, str | None, str]:
+    cleaned = str(value).strip()
+    if not cleaned:
+        raise ValueError("Empty qualified name")
+
+    tokens = [part.strip().strip("`") for part in cleaned.split(".") if part.strip()]
+    if len(tokens) == 3:
+        return tokens[0], tokens[1], tokens[2]
+    if len(tokens) == 2:
+        return None, tokens[0], tokens[1]
+    if len(tokens) == 1:
+        return None, None, tokens[0]
+    raise ValueError(f"Invalid qualified name: {value}")
+
+
+def _parse_expr_reference(expr: str) -> tuple[str, str] | None:
+    token = str(expr).strip().strip("`")
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", token)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _yaml_safe_load(text: str) -> Any:
+    yaml_mod = importlib.import_module("yaml")
+    return yaml_mod.safe_load(text)
+
+
+def _yaml_safe_dump(value: Any) -> str:
+    yaml_mod = importlib.import_module("yaml")
+    return yaml_mod.safe_dump(value, sort_keys=False)
+
+
+def _extract_yaml_from_dataframe(df: pd.DataFrame) -> str | None:
+    if df.empty:
+        return None
+
+    yaml_col_names = [
+        col
+        for col in df.columns
+        if "yaml" in str(col).lower() or "definition" in str(col).lower()
+    ]
+
+    for col in yaml_col_names + list(df.columns):
+        for value in df[col].tolist():
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text:
+                continue
+            if "source:" in text and ("dimensions:" in text or "measures:" in text):
+                return text
+
+    return None
+
+
+def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
+    namespace = _qualified_ident(catalog, schema)
+    escaped_schema = schema.replace("'", "''")
+    queries = [
+        f"SHOW METRIC VIEWS IN {namespace}",
+        (
+            "SELECT table_name "
+            f"FROM {_qualified_ident(catalog, 'information_schema', 'tables')} "
+            f"WHERE table_schema = '{escaped_schema}' AND upper(table_type) IN ('METRIC_VIEW', 'METRIC VIEW')"
+        ),
+    ]
+
+    names: set[str] = set()
+    for sql in queries:
+        try:
+            df = _run_startup_sql(sql)
+        except Exception:
+            LOGGER.info("Metric view discovery query failed: %s", sql)
+            continue
+
+        if df.empty:
+            continue
+
+        lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
+        name_col = (
+            lower_to_actual.get("metric_view_name")
+            or lower_to_actual.get("view_name")
+            or lower_to_actual.get("table_name")
+            or lower_to_actual.get("name")
+            or df.columns[0]
+        )
+
+        for raw in df[name_col].tolist():
+            if pd.isna(raw):
+                continue
+            metric_view_name = str(raw).strip().strip("`")
+            if metric_view_name:
+                names.add(metric_view_name)
+
+    return sorted(names)
+
+
+def _fetch_metric_view_yaml(catalog: str, schema: str, metric_view_name: str) -> str | None:
+    qualified_name = _qualified_ident(catalog, schema, metric_view_name)
+    queries = [
+        f"DESCRIBE METRIC VIEW {qualified_name}",
+        f"DESCRIBE EXTENDED {qualified_name}",
+    ]
+
+    for sql in queries:
+        try:
+            df = _run_startup_sql(sql)
+        except Exception:
+            LOGGER.info("Metric view describe query failed for %s: %s", metric_view_name, sql)
+            continue
+
+        yaml_text = _extract_yaml_from_dataframe(df)
+        if yaml_text:
+            return yaml_text
+
+    return None
+
+"""
+def _to_model_type_from_dim_expr(expr: str) -> str:
+    lowered = str(expr).lower()
+    if any(token in lowered for token in ["date", "time", "timestamp"]):
+        return "date"
+    if any(token in lowered for token in ["id", "count", "qty", "num", "amount", "key"]):
+        return "numeric"
+    return "string"
+"""
+
+"""
+def _to_model_type_from_measure_expr(expr: str) -> str:
+    lowered = str(expr).lower()
+    if any(token in lowered for token in ["count(", "sum(", "avg(", "min(", "max(", "amount", "qty"]):
+        return "numeric"
+    return "numeric"
+"""
+
+def _parse_metric_view_yaml(
+    model_id: str,
+    catalog: str,
+    schema: str,
+    metric_view_name: str,
+    yaml_text: str,
+) -> MetricViewDef:
+    """
+    Parse a Databricks metric-view YAML directly into a MetricViewDef.
+
+    Mapping rules
+    -------------
+    joins[].on  → determines which dimension field is the key for each join.
+    dimensions[].expr = alias.col  → dimension field on the metric view;
+        if col == join dim_key → field_type="dimension_key", else "dimension_attr".
+    If a join key is not explicitly present in dimensions[], synthesize one
+        from joins[].on so each dimension group has a key field.
+    dimensions[].expr = source.*  → skipped (fact-level, not exposed as dim field).
+    measures[]  → field_type="measure".
+    """
+    raw = _yaml_safe_load(yaml_text) or {}
+
+    joins = raw.get("joins", []) or []
+    dimensions = raw.get("dimensions", []) or []
+    measures_raw = raw.get("measures", []) or []
+
+    # Build join map: alias → {dim_name, dim_key}
+    join_info: dict[str, dict[str, str]] = {}
+    for join in joins:
+        alias = str(join.get("name") or "").strip()
+        on_expr = str(join.get("on") or join.get('"on"') or "").strip()
+        if not alias or not on_expr or "=" not in on_expr:
+            continue
+        left, right = [p.strip() for p in on_expr.split("=", 1)]
+        left_ref = _parse_expr_reference(left)
+        right_ref = _parse_expr_reference(right)
+        if not left_ref or not right_ref:
+            continue
+        dim_side = None
+        if left_ref[0] == "source" and right_ref[0] == alias:
+            dim_side = right_ref
+        elif right_ref[0] == "source" and left_ref[0] == alias:
+            dim_side = left_ref
+        if dim_side:
+            join_info[alias] = {
+                "dim_name": alias.replace("_", " ").title(),
+                "dim_key": dim_side[1],
+            }
+
+    fields: list[MvField] = []
+    seen: set[str] = set()
+
+    for dim in dimensions:
+        dim_name = str(dim.get("name") or "").strip()
+        expr = str(dim.get("expr") or "").strip()
+        label = str(dim.get("display_name") or dim_name or "").strip() or dim_name
+        if not dim_name or dim_name in seen:
+            continue
+        ref = _parse_expr_reference(expr)
+        if not ref:
+            continue
+        alias, col = ref
+        if alias == "source":
+            continue  # fact-level; not a dimension field on the metric view
+        if alias not in join_info:
+            continue
+        ji = join_info[alias]
+        field_type = "dimension_key" if col == ji["dim_key"] else "dimension_attr"
+        seen.add(dim_name)
+        fields.append(MvField(
+            name=dim_name,
+            label=label,
+            field_type=field_type,
+            group_name=ji["dim_name"],
+            default_show=True,
+        ))
+
+    # Ensure each dimension group has a key field even when YAML dimensions
+    # only listed attributes.
+    for alias, ji in join_info.items():
+        group_name = ji["dim_name"]
+        has_group_key = any(
+            f.group_name == group_name and f.field_type == "dimension_key"
+            for f in fields
+        )
+        key_name = ji["dim_key"]
+        if has_group_key or key_name in seen:
+            continue
+
+        seen.add(key_name)
+        fields.append(MvField(
+            name=key_name,
+            label=key_name,
+            field_type="dimension_key",
+            group_name=group_name,
+            default_show=False,
+        ))
+
+    for measure in measures_raw:
+        m_name = str(measure.get("name") or "").strip()
+        m_label = str(measure.get("display_name") or m_name or "").strip() or m_name
+        if not m_name or m_name in seen:
+            continue
+        seen.add(m_name)
+        fields.append(MvField(
+            name=m_name,
+            label=m_label,
+            field_type="measure",
+            group_name="Metrics",
+            default_show=True,
+        ))
+
+    return MetricViewDef(
+        model_id=model_id,
+        catalog=catalog,
+        schema=schema,
+        metric_view_name=metric_view_name,
+        display_name=f"Metric View {metric_view_name}",
+        fields=fields,
+    )
+
+
+def load_metric_views(catalog: str, schema: str) -> dict[str, MetricViewDef]:
+    """Discover and parse all metric views in a catalog/schema into MetricViewDef objects."""
+    metric_view_names = _discover_metric_view_names(catalog, schema)
+    if not metric_view_names:
+        LOGGER.info("No metric views discovered in %s.%s", catalog, schema)
+        return {}
+
+    result: dict[str, MetricViewDef] = {}
+    for mv_name in metric_view_names:
+        yaml_text = _fetch_metric_view_yaml(catalog, schema, mv_name)
+        if not yaml_text:
+            STARTUP_WARNINGS.append(
+                f"Could not read YAML for metric view {catalog}.{schema}.{mv_name}; skipping."
+            )
+            continue
+        model_id = metric_view_model_id(catalog, schema, mv_name)
+        try:
+            result[mv_name] = _parse_metric_view_yaml(model_id, catalog, schema, mv_name, yaml_text)
+        except Exception:
+            STARTUP_WARNINGS.append(
+                f"Failed parsing metric view {mv_name}; skipping."
+            )
+            LOGGER.info("Failed parsing metric view %s", mv_name, exc_info=True)
+
+    LOGGER.info("Loaded %s metric view(s) from %s.%s", len(result), catalog, schema)
+    return result
 
 
 def _run_startup_sql(sql: str) -> pd.DataFrame:
@@ -125,7 +971,7 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
             if not value
         ]
         if missing:
-            LOGGER.warning("Skipping models table lookup (missing SQL env vars): %s", ", ".join(missing))
+            LOGGER.warning("Skipping startup Databricks lookup (missing SQL env vars): %s", ", ".join(missing))
             return pd.DataFrame()
 
         sql_mod = importlib.import_module("databricks.sql")
@@ -148,78 +994,41 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
     return spark.sql(sql).toPandas()
 
 
-def load_models_from_env_table() -> dict[str, str]:
-    """
-    Load models from the environment-configured table if configured.
+REPORT_DEFS = load_report_definitions()
 
-    Expected columns:
-      - ModelName
-      - ModelDefinition
-    """
-    catalog = os.getenv("MODELS_TABLE_CATALOG")
-    schema = os.getenv("MODELS_TABLE_SCHEMA")
-    table = os.getenv("MODELS_TABLE_NAME")
-
-    if not (catalog and schema and table):
-        LOGGER.info("Model_table_catalog = %s, Model_table_schema = %s, Model_table_name = %s", catalog, schema, table)        
-        LOGGER.info("Models table env vars not fully set; skipping table model discovery.")
-        return {}
-
-    qualified = ".".join([_quoted_ident(catalog), _quoted_ident(schema), _quoted_ident(table)])
-    sql = f"SELECT * FROM {qualified}"
-
-    try:
-        df = _run_startup_sql(sql)
-    except Exception:
-        STARTUP_WARNINGS.append(
-            f"Configured models table {catalog}.{schema}.{table} was not found or could not be read. Continuing with local model files."
-        )
-        LOGGER.info("Failed reading models from table %s; continuing with local model files.", qualified)
-        return {}
-
-    if df.empty:
-        LOGGER.info("No rows found in models table %s", qualified)
-        return {}
-
-    lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
-    name_col = lower_to_actual.get("modelname")
-    def_col = lower_to_actual.get("modeldefinition")
-
-    if not name_col or not def_col:
-        LOGGER.warning(
-            "Models table %s missing expected columns ModelName/ModelDefinition. Found: %s",
-            qualified,
-            list(df.columns),
-        )
-        return {}
-
-    models: dict[str, str] = {}
-    for _, row in df.iterrows():
-        model_name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
-        model_def = str(row[def_col]).strip() if pd.notna(row[def_col]) else ""
-        if not model_name or not model_def:
-            continue
-        models[model_name] = model_def
-
-    LOGGER.info("Loaded %s model definition(s) from table %s", len(models), qualified)
-    return models
+ACCESS_MATRIX_DF = _build_access_matrix()
+logging.info("Access matrix built with %s entries", len(ACCESS_MATRIX_DF))
+logging.info("%s", ACCESS_MATRIX_DF)
 
 
-MODEL_FILES = discover_model_files()
-DEFAULT_MODEL_ID = next(iter(MODEL_FILES.keys()))
-MODEL_CACHE: dict[str, OlapModel] = {}
 DB_CACHE: dict[str, OlapDatabase] = {}
 
+CATALOG_OPTIONS = get_catalog_dropdown_options_from_matrix()
+INITIAL_CATALOG_VALUE = None
+INITIAL_SCHEMA_OPTIONS = get_all_schema_dropdown_options_from_matrix()
+INITIAL_SCHEMA_VALUE = None
+INITIAL_MODEL_VALUE = None
+INITIAL_MODEL_OPTIONS = get_all_model_dropdown_options_from_matrix()
 
-def get_model(model_id: str) -> OlapModel:
-    if model_id not in MODEL_CACHE:
-        MODEL_CACHE[model_id] = OlapModel.from_yaml(MODEL_FILES[model_id])
-    return MODEL_CACHE[model_id]
+
+def model_exists(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    return str(model_id) in METRIC_VIEW_REGISTRY
+
+
+def get_mv_def(model_id: str) -> MetricViewDef:
+    mv_def = METRIC_VIEW_REGISTRY.get(model_id)
+    if mv_def is None:
+        raise KeyError(f"Unknown model id: {model_id}")
+    return mv_def
 
 
 def get_backend(model_id: str) -> OlapDatabase:
+    if not model_exists(model_id):
+        raise KeyError(f"Unknown model id: {model_id}")
     if model_id not in DB_CACHE:
-        DB_CACHE[model_id] = create_databricks_backend(get_model(model_id))
+        DB_CACHE[model_id] = create_databricks_backend(get_mv_def(model_id))
     return DB_CACHE[model_id]
 
 
@@ -228,42 +1037,46 @@ def get_flat_table(model_id: str) -> pd.DataFrame:
     return get_backend(model_id).execute(request)
 
 
-def build_default_request(model: OlapModel, max_rows: int | None = None) -> OlapQueryRequest:
-    default_rows: list[str] = []
-    default_metrics = [metric.name for metric in model.metrics if metric.default_show]
-
-    for dim in model.dimensions:
-        if dim.default_show:
-            default_rows.append(dim.dim_key)
-        for attr in dim.attributes:
-            if attr.default_show:
-                default_rows.append(attr.name)
-
+def build_default_request(mv_def: MetricViewDef, max_rows: int | None = None) -> OlapQueryRequest:
+    default_rows = [f.name for f in mv_def.dimension_fields if f.default_show]
+    default_metrics = [f.name for f in mv_def.measures if f.default_show]
     if not default_rows and not default_metrics:
         return OlapQueryRequest(max_rows=max_rows)
-
-    deduped_rows = list(dict.fromkeys(default_rows))
-    return OlapQueryRequest(rows=deduped_rows, metrics=default_metrics, max_rows=max_rows)
+    return OlapQueryRequest(
+        rows=list(dict.fromkeys(default_rows)),
+        metrics=default_metrics,
+        max_rows=max_rows,
+    )
 
 
 def get_default_view_table(model_id: str, max_rows: int | None = None) -> pd.DataFrame:
-    model = get_model(model_id)
-    request = build_default_request(model, max_rows=max_rows or DEFAULT_MAX_ROWS)
+    mv_def = get_mv_def(model_id)
+    request = build_default_request(mv_def, max_rows=max_rows or DEFAULT_MAX_ROWS)
     return get_backend(model_id).execute(request)
 
 
-def get_default_visible_fields(model: OlapModel) -> set[str]:
-    visible_fields: set[str] = set()
-    for dim in model.dimensions:
-        if dim.default_show:
-            visible_fields.add(dim.dim_key)
-        for attr in dim.attributes:
-            if attr.default_show:
-                visible_fields.add(attr.name)
-    for metric in model.metrics:
-        if metric.default_show:
-            visible_fields.add(metric.name)
-    return visible_fields
+def get_default_visible_fields(mv_def: MetricViewDef) -> set[str]:
+    return {f.name for f in mv_def.fields if f.default_show}
+
+
+def expand_visible_fields_with_dimension_keys(
+    mv_def: MetricViewDef,
+    visible_fields: set[str],
+) -> set[str]:
+    expanded = set(visible_fields)
+    keys_by_group: dict[str, str] = {}
+    for field in mv_def.dimension_fields:
+        if field.field_type == "dimension_key" and field.group_name not in keys_by_group:
+            keys_by_group[field.group_name] = field.name
+
+    for group_name in mv_def.groups:
+        group_fields = {field.name for field in mv_def.fields_for_group(group_name)}
+        if expanded.intersection(group_fields):
+            key_field = keys_by_group.get(group_name)
+            if key_field:
+                expanded.add(key_field)
+
+    return expanded
 
 
 def sanitize_max_rows(value) -> int | None:
@@ -339,51 +1152,33 @@ def build_filters_from_filter_model(filter_model) -> dict[str, dict[str, list]]:
 
 
 def get_model_dropdown_options() -> list[dict[str, str]]:
-    options: list[dict[str, str]] = []
-    for model_id in MODEL_FILES.keys():
-        label = get_model(model_id).name
-        options.append({"label": label, "value": model_id})
-    return options
+    return []
 
 
-def get_allowed_filter_fields(model: OlapModel) -> set[str]:
-    fields: set[str] = set(model.fact.join_keys)
-    for dim in model.dimensions:
-        fields.add(dim.dim_key)
-        fields.add(dim.display_key)
-        for attr in dim.attributes:
-            fields.add(attr.name)
-    return fields
+def get_allowed_filter_fields(mv_def: MetricViewDef) -> set[str]:
+    return mv_def.all_field_names
 
 
-def get_dimension_filter_fields(model: OlapModel) -> list[str]:
-    fields: set[str] = set()
-    for dim in model.dimensions:
-        fields.add(dim.dim_key)
-        fields.add(dim.display_key)
-        for attr in dim.attributes:
-            fields.add(attr.name)
-    return sorted(fields)
+def get_dimension_filter_fields(mv_def: MetricViewDef) -> list[str]:
+    return sorted(f.name for f in mv_def.dimension_fields)
 
 
 def get_dimension_dropdown_options(model_id: str) -> list[dict[str, str]]:
-    model = get_model(model_id)
-    return [{"label": dim.name, "value": dim.name} for dim in model.dimensions]
+    if not model_exists(model_id):
+        return []
+    mv_def = get_mv_def(model_id)
+    return [{"label": g, "value": g} for g in mv_def.groups]
 
 
 def get_field_filter_dropdown_options(model_id: str, dimension_name: str | None) -> list[dict[str, str]]:
-    model = get_model(model_id)
-    if not dimension_name:
+    if not model_exists(model_id) or not dimension_name:
         return []
-
-    dim = next((d for d in model.dimensions if d.name == dimension_name), None)
-    if dim is None:
-        return []
-
-    options: list[dict[str, str]] = [{"label": "Key", "value": dim.dim_key}]
-    for attr in dim.attributes:
-        options.append({"label": attr.label, "value": attr.name})
-    return options
+    mv_def = get_mv_def(model_id)
+    return [
+        {"label": f.label, "value": f.name}
+        for f in mv_def.fields_for_group(dimension_name)
+        if f.field_type != "measure"
+    ]
 
 
 def _split_csv_values(value: str | None) -> list[str]:
@@ -391,7 +1186,7 @@ def _split_csv_values(value: str | None) -> list[str]:
     return [p for p in parts if p]
 
 
-def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dict[str, dict[str, list]], str | None]:
+def parse_manual_filters(filter_text: str | None, mv_def: MetricViewDef) -> tuple[dict[str, dict[str, list]], str | None]:
     text = (filter_text or "").strip()
     if not text:
         return {}, None
@@ -404,7 +1199,7 @@ def parse_manual_filters(filter_text: str | None, model: OlapModel) -> tuple[dic
     if not isinstance(raw, dict):
         return {}, "Filter JSON must be an object: {\"field\": [values...]}"
 
-    allowed = get_allowed_filter_fields(model)
+    allowed = get_allowed_filter_fields(mv_def)
     parsed: dict[str, dict[str, list]] = {}
 
     for field, value in raw.items():
@@ -467,118 +1262,77 @@ def startup_warning_style(hidden: bool) -> dict[str, str]:
     }
 
 # ---------------------------------------------------------------------------
-# Grid column-definition builders  (driven entirely by the model)
+# Grid column-definition builders  (driven by MetricViewDef)
 # ---------------------------------------------------------------------------
 
 def _label(name: str) -> str:
     return name.replace("_", " ").title()
 
 
-def _dim_field_def(col_name: str, dim: DimensionDef, model_id: str) -> dict:
-    """Build an AG Grid column def for a dimension attribute or display key."""
-    is_display_key = col_name == dim.display_key
-    is_key = col_name == dim.dim_key or is_display_key
-
-    label = "Key" if is_key else next(
-        (a.label for a in dim.attributes if a.name == col_name),
-        _label(col_name),
-    )
-
-    col_def = {
-        "field": col_name,
-        "headerName": label,
-        "isDimension": True,
-        "sortable": True,
-        "filter": False,
-        "resizable": True,
-        "hide": is_display_key,
-        "enablePivot": True,
-        "enableRowGroup": True,
-    }
-
-    return col_def
-
-
-def _metric_field_def(metric: MetricDef) -> dict:
-    """Build an AG Grid column def for a metric."""
-    return {
-        "field": metric.name,
-        "headerName": metric.label,
-        "isDimension": False,
-        "sortable": True,
-        "filter": False,
-        "resizable": True,
-        "type": "numericColumn",
-        "enableValue": True,
-        "aggFunc": metric.default_agg,
-        "allowedAggFuncs": metric.allowed_aggs,
-    }
-
-
-def _join_key_field_def(key: str) -> dict:
-    """Surrogate join keys — always hidden, never grouped/pivoted."""
-    return {
-        "field": key,
-        "headerName": _label(key),
-        "isDimension": False,
-        "hide": True,
-        "sortable": False,
-        "filter": False,
-        "resizable": False,
-    }
-
-
 def build_column_defs(
     df: pd.DataFrame,
-    model: OlapModel,
-    model_id: str,
+    mv_def: MetricViewDef,
+    visible_fields: set[str] | None = None,
 ) -> list[dict]:
     """
-    Build the full grouped column-def tree for AG Grid.
-    Groups: one per dimension + Metrics. Surrogate keys are hidden leaves.
+    Build the full grouped column-def tree for AG Grid from a MetricViewDef.
+
+    All dimension fields are always emitted so the columns panel is fully
+    populated.  Visibility is controlled by `visible_fields`:
+      - When provided (report-driven view): only those fields are visible.
+      - When None: all fields shown (use model default_show for further tuning).
+    Measures are only included when they appear in the SQL result.
     """
     defs: list[dict] = []
-    known_fields: set[str] = set()
-    default_visible_fields = get_default_visible_fields(model)
-    has_default_visibility = bool(default_visible_fields)
+    df_cols: set[str] = set(df.columns)
 
-    # Dimension groups
-    for dim in model.dimensions:
+    def _is_visible(field_name: str) -> bool:
+        if visible_fields is None:
+            return True
+        return field_name in visible_fields
+
+    # Group dimension fields by group_name (one AG Grid group per dimension)
+    groups_seen: list[str] = []
+    for f in mv_def.dimension_fields:
+        if f.group_name not in groups_seen:
+            groups_seen.append(f.group_name)
+
+    for group_name in groups_seen:
         children: list[dict] = []
-        if dim.display_key in df.columns or 1==1:
-            key_def = _dim_field_def(dim.dim_key, dim, model_id)
-            if has_default_visibility:
-                key_def["hide"] = dim.dim_key not in default_visible_fields
-            children.append(key_def)
-            known_fields.add(dim.dim_key)
-        for attr in dim.attributes:
-            if attr.name in df.columns or 1==1:
-                attr_def = _dim_field_def(attr.name, dim, model_id)
-                if has_default_visibility:
-                    attr_def["hide"] = attr.name not in default_visible_fields
-                children.append(attr_def)
-                known_fields.add(attr.name)
+        for f in mv_def.fields_for_group(group_name):
+            if f.field_type == "measure":
+                continue
+            children.append({
+                "field": f.name,
+                "headerName": f.label,
+                "isDimension": True,
+                "sortable": True,
+                "filter": False,
+                "resizable": True,
+                "hide": not _is_visible(f.name),
+                "enablePivot": True,
+                "enableRowGroup": True,
+            })
         if children:
-            defs.append({"headerName": dim.name, "children": children})
+            defs.append({"headerName": group_name, "children": children})
 
-    # Metrics group
-    metric_children = []
-    for metric in model.metrics:
-        if metric.name in df.columns:
-            metric_def = _metric_field_def(metric)
-            if has_default_visibility:
-                metric_def["hide"] = metric.name not in default_visible_fields
-            metric_children.append(metric_def)
-    for child in metric_children:
-        known_fields.add(child["field"])
-    if metric_children:
-        defs.append({"headerName": "Metrics", "children": metric_children})
-
-    # Hidden surrogate join keys
-    for key in model.all_join_keys:
-        if key in df.columns and key not in known_fields:
-            defs.append(_join_key_field_def(key))
-            known_fields.add(key)
+    # Measures — only for those returned by the current SQL result
+    measure_children: list[dict] = []
+    for f in mv_def.measures:
+        if f.name in df_cols:
+            measure_children.append({
+                "field": f.name,
+                "headerName": f.label,
+                "isDimension": False,
+                "sortable": True,
+                "filter": False,
+                "resizable": True,
+                "type": "numericColumn",
+                "enableValue": True,
+                "hide": not _is_visible(f.name),
+            })
+    if measure_children:
+        defs.append({"headerName": "Metrics", "children": measure_children})
 
     return defs
 
@@ -661,9 +1415,8 @@ def api_filter_values():
         )
         return jsonify({"values": []})
 
-initial_model = get_model(DEFAULT_MODEL_ID)
-initial_df = get_default_view_table(DEFAULT_MODEL_ID)
-initial_user = get_logged_in_user(DEFAULT_MODEL_ID)
+initial_df = pd.DataFrame()
+initial_user = "Unknown user"
 
 app.layout = html.Div(
     style={
@@ -676,21 +1429,15 @@ app.layout = html.Div(
     children=[
         # Hidden store to track filter model changes
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
+        dcc.Store(id="column-change-trigger", data={"timestamp": 0, "columnState": []}),
         dcc.Store(id="manual-filter-store", data={"timestamp": 0, "filters": {}}),
-        dcc.Input(id="field-filter-active-model", value=DEFAULT_MODEL_ID, style={"display": "none"}),
+        dcc.Store(id="active-report-store", data={"id": "", "timestamp": pd.Timestamp.utcnow().isoformat()}),
+        dcc.Store(id="field-filter-values-target", data={"mode": "include"}),
+        dcc.Store(id="field-filter-modal-context", data={}),
+        dcc.Input(id="field-filter-active-model", value="", style={"display": "none"}),
         dcc.Input(
             id="field-filter-active-field",
-            value=(
-                get_field_filter_dropdown_options(
-                    DEFAULT_MODEL_ID,
-                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
-                )[0]["value"]
-                if get_field_filter_dropdown_options(
-                    DEFAULT_MODEL_ID,
-                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
-                )
-                else ""
-            ),
+            value="",
             style={"display": "none"},
         ),
         html.Div(
@@ -744,19 +1491,55 @@ app.layout = html.Div(
             },
             children=[
                 html.Div(
-                    style={"maxWidth": "320px", "minWidth": "240px"},
+                    style={"width": "300px"},
                     children=[
-                        html.Div("Model", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        html.Div("Catalog", style={"fontWeight": "600", "marginBottom": "6px"}),
                         dcc.Dropdown(
-                            id="model-selector",
-                            options=get_model_dropdown_options(),
-                            value=DEFAULT_MODEL_ID,
+                            id="catalog-selector",
+                            options=CATALOG_OPTIONS,
+                            value=INITIAL_CATALOG_VALUE,
                             clearable=False,
                         ),
                     ],
                 ),
                 html.Div(
-                    style={"maxWidth": "180px", "paddingRight": "16px"},
+                    style={"width": "300px"},
+                    children=[
+                        html.Div("Schema", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="schema-selector",
+                            options=INITIAL_SCHEMA_OPTIONS,
+                            value=INITIAL_SCHEMA_VALUE,
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"width": "300px"},
+                    children=[
+                        html.Div("Metric View", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="model-selector",
+                            options=INITIAL_MODEL_OPTIONS,
+                            value=INITIAL_MODEL_VALUE,
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"width": "300px"},
+                    children=[
+                        html.Div("Report", style={"fontWeight": "600", "marginBottom": "6px"}),
+                        dcc.Dropdown(
+                            id="report-selector",
+                            options=[],
+                            value=None,
+                            clearable=False,
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"width": "300px", "paddingRight": "16px"},
                     children=[
                         html.Div("Max rows", style={"fontWeight": "600", "marginBottom": "6px"}),
                         dcc.Input(
@@ -774,19 +1557,8 @@ app.layout = html.Div(
                     style={"display": "flex", "gap": "16px", "alignItems": "flex-end"},
                     children=[
                         html.Button(
-                            filter_button_label(0),
-                            id="open-filter-json-btn",
-                            n_clicks=0,
-                            style={
-                                "height": "38px",
-                                "padding": "0 14px",
-                                "background": "#f3f4f6",
-                                "border": "1px solid #d1d5db",
-                            },
-                        ),
-                        html.Button(
-                            "Clear Filters",
-                            id="clear-filters-btn",
+                            "Static Filters",
+                            id="open-report-filter-json-btn",
                             n_clicks=0,
                             style={
                                 "height": "38px",
@@ -809,65 +1581,28 @@ app.layout = html.Div(
             },
             children=[
                 html.Div(
-                    style={"minWidth": "240px", "maxWidth": "280px"},
+                    style={"width": "300px"},
                     children=[
                         html.Div("Dimension", style={"fontWeight": "600", "marginBottom": "6px"}),
                         dcc.Dropdown(
                             id="field-filter-dimension-selector",
-                            options=get_dimension_dropdown_options(DEFAULT_MODEL_ID),
-                            value=(get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None),
+                            options=[],
+                            value=None,
                             clearable=False,
+                            style={"width": "100%"},
                         ),
                     ],
                 ),
                 html.Div(
-                    style={"minWidth": "240px", "maxWidth": "280px"},
+                    style={"width": "300px"},
                     children=[
                         html.Div("Attribute", style={"fontWeight": "600", "marginBottom": "6px"}),
                         dcc.Dropdown(
                             id="field-filter-selector",
-                            options=get_field_filter_dropdown_options(
-                                DEFAULT_MODEL_ID,
-                                get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
-                            ),
-                            value=(
-                                get_field_filter_dropdown_options(
-                                    DEFAULT_MODEL_ID,
-                                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
-                                )[0]["value"]
-                                if get_field_filter_dropdown_options(
-                                    DEFAULT_MODEL_ID,
-                                    get_dimension_dropdown_options(DEFAULT_MODEL_ID)[0]["value"] if get_dimension_dropdown_options(DEFAULT_MODEL_ID) else None,
-                                )
-                                else None
-                            ),
+                            options=[],
+                            value=None,
                             clearable=False,
-                        ),
-                    ],
-                ),
-                html.Div(
-                    style={"minWidth": "240px", "paddingRight": "16px"},
-                    children=[
-                        html.Div("Include values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
-                        dcc.Input(
-                            id="field-filter-include-input",
-                            type="text",
-                            placeholder="e.g. 2024, 2025",
-                            debounce=True,
-                            style={"width": "100%", "padding": "8px"},
-                        ),
-                    ],
-                ),
-                html.Div(
-                    style={"minWidth": "240px", "paddingRight": "16px"},
-                    children=[
-                        html.Div("Exclude values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
-                        dcc.Input(
-                            id="field-filter-exclude-input",
-                            type="text",
-                            placeholder="e.g. APAC",
-                            debounce=True,
-                            style={"width": "100%", "padding": "8px"},
+                            style={"width": "100%"},
                         ),
                     ],
                 ),
@@ -883,8 +1618,19 @@ app.layout = html.Div(
                     },
                 ),
                 html.Button(
-                    "Clear Filter",
-                    id="clear-field-filter-btn",
+                    filter_button_label(0),
+                    id="open-filter-json-btn",
+                    n_clicks=0,
+                    style={
+                        "height": "38px",
+                        "padding": "0 14px",
+                        "background": "#f3f4f6",
+                        "border": "1px solid #d1d5db",
+                    },
+                ),
+                html.Button(
+                    "Clear Filters",
+                    id="clear-filters-btn",
                     n_clicks=0,
                     style={
                         "height": "38px",
@@ -969,6 +1715,284 @@ app.layout = html.Div(
             ],
         ),
         html.Div(
+            id="report-filter-json-modal",
+            style={
+                "display": "none",
+                "position": "fixed",
+                "inset": "0",
+                "background": "rgba(0, 0, 0, 0.35)",
+                "zIndex": 2000,
+                "alignItems": "center",
+                "justifyContent": "center",
+            },
+            children=[
+                html.Div(
+                    style={
+                        "width": "760px",
+                        "maxWidth": "95vw",
+                        "background": "#fff",
+                        "borderRadius": "10px",
+                        "padding": "14px",
+                        "boxSizing": "border-box",
+                        "boxShadow": "0 10px 30px rgba(0, 0, 0, 0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
+                            children=[
+                                html.Div("Report Filters (JSON)", style={"fontWeight": "700"}),
+                                html.Button(
+                                    "X",
+                                    id="close-report-filter-json-x-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "background": "#fff",
+                                        "borderRadius": "6px",
+                                        "padding": "4px 8px",
+                                        "cursor": "pointer",
+                                        "fontWeight": "700",
+                                    },
+                                ),
+                            ],
+                        ),
+                        dcc.Textarea(
+                            id="report-filter-editor",
+                            value="{}",
+                            readOnly=True,
+                            style={
+                                "width": "100%",
+                                "height": "240px",
+                                "padding": "8px",
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                                "boxSizing": "border-box",
+                                "background": "#f9fafb",
+                            },
+                        ),
+                        html.Div(
+                            "Read-only filters from the selected report YAML.",
+                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "6px"},
+                        ),
+                    ],
+                )
+            ],
+        ),
+        html.Div(
+            id="field-filter-modal",
+            style={
+                "display": "none",
+                "position": "fixed",
+                "inset": "0",
+                "background": "rgba(0, 0, 0, 0.35)",
+                "zIndex": 2100,
+                "alignItems": "center",
+                "justifyContent": "center",
+            },
+            children=[
+                html.Div(
+                    style={
+                        "width": "680px",
+                        "maxWidth": "95vw",
+                        "background": "#fff",
+                        "borderRadius": "10px",
+                        "padding": "14px",
+                        "boxSizing": "border-box",
+                        "boxShadow": "0 10px 30px rgba(0, 0, 0, 0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Set Dimension Filter", id="field-filter-modal-title", style={"fontWeight": "700"}),
+                                html.Button(
+                                    "X",
+                                    id="close-field-filter-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "background": "#fff",
+                                        "borderRadius": "6px",
+                                        "padding": "4px 8px",
+                                        "cursor": "pointer",
+                                        "fontWeight": "700",
+                                    },
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "12px", "alignItems": "end", "flexWrap": "wrap"},
+                            children=[
+                                html.Div(
+                                    style={"width": "300px"},
+                                    children=[
+                                        html.Div("Include values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
+                                        dcc.Input(
+                                            id="field-filter-modal-include-input",
+                                            type="text",
+                                            placeholder="e.g. EMEA, APAC",
+                                            debounce=True,
+                                            n_submit=0,
+                                            style={"width": "100%", "padding": "8px", "boxSizing": "border-box"},
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style={"width": "300px"},
+                                    children=[
+                                        html.Div("Exclude values (csv)", style={"fontWeight": "600", "marginBottom": "6px"}),
+                                        dcc.Input(
+                                            id="field-filter-modal-exclude-input",
+                                            type="text",
+                                            placeholder="e.g. Internal",
+                                            debounce=True,
+                                            n_submit=0,
+                                            style={"width": "100%", "padding": "8px", "boxSizing": "border-box"},
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            "Tip: Enter ? in include or exclude and press Apply to see valid values.",
+                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "8px"},
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "10px", "justifyContent": "flex-end", "marginTop": "12px"},
+                            children=[
+                                html.Button(
+                                    "Clear Filter",
+                                    id="clear-field-filter-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "height": "36px",
+                                        "padding": "0 14px",
+                                        "background": "#fff",
+                                        "border": "1px solid #d1d5db",
+                                    },
+                                ),
+                                html.Button(
+                                    "Cancel",
+                                    id="cancel-field-filter-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "height": "36px",
+                                        "padding": "0 14px",
+                                        "background": "#fff",
+                                        "border": "1px solid #d1d5db",
+                                    },
+                                ),
+                                html.Button(
+                                    "Apply",
+                                    id="apply-field-filter-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "height": "36px",
+                                        "padding": "0 14px",
+                                        "background": "#f3f4f6",
+                                        "border": "1px solid #d1d5db",
+                                    },
+                                ),
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+        html.Div(
+            id="field-filter-values-modal",
+            style={
+                "display": "none",
+                "position": "fixed",
+                "inset": "0",
+                "background": "rgba(0, 0, 0, 0.35)",
+                "zIndex": 2200,
+                "alignItems": "center",
+                "justifyContent": "center",
+            },
+            children=[
+                html.Div(
+                    style={
+                        "width": "760px",
+                        "maxWidth": "95vw",
+                        "background": "#fff",
+                        "borderRadius": "10px",
+                        "padding": "14px",
+                        "boxSizing": "border-box",
+                        "boxShadow": "0 10px 30px rgba(0, 0, 0, 0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
+                            children=[
+                                html.Div("Valid Values", id="field-filter-values-title", style={"fontWeight": "700"}),
+                            ],
+                        ),
+                        html.Div(
+                            style={
+                                "maxHeight": "300px",
+                                "overflowY": "auto",
+                                "border": "1px solid #e5e7eb",
+                                "borderRadius": "8px",
+                                "padding": "8px",
+                                "background": "#f9fafb",
+                            },
+                            children=[
+                                dcc.Checklist(
+                                    id="field-filter-values-checklist",
+                                    options=[],
+                                    value=[],
+                                    inputStyle={"marginRight": "8px"},
+                                    labelStyle={"display": "block", "marginBottom": "6px"},
+                                )
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "flex-end", "gap": "10px", "marginTop": "12px"},
+                            children=[
+                                html.Button(
+                                    "Cancel",
+                                    id="close-field-filter-values-modal-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "height": "36px",
+                                        "padding": "0 14px",
+                                        "background": "#fff",
+                                        "border": "1px solid #d1d5db",
+                                    },
+                                ),
+                                html.Button(
+                                    "Use Selected",
+                                    id="apply-field-filter-values-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "height": "36px",
+                                        "padding": "0 14px",
+                                        "background": "#f3f4f6",
+                                        "border": "1px solid #d1d5db",
+                                    },
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            "Choose one or more values and click Use Selected.",
+                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "8px"},
+                        ),
+                        html.Div(
+                            id="field-filter-values-empty-note",
+                            children="",
+                            style={
+                                "width": "100%",
+                                "fontSize": "12px",
+                                "color": "#6b7280",
+                                "marginTop": "6px",
+                            },
+                        ),
+                    ],
+                )
+            ],
+        ),
+        html.Div(
             style={
                 "border": "1px solid #d1d5db",
                 "borderRadius": "8px",
@@ -979,9 +2003,15 @@ app.layout = html.Div(
                 dag.AgGrid(
                     id="olap-grid",
                     rowData=initial_df.to_dict("records"),
-                    columnDefs=build_column_defs(initial_df, initial_model, DEFAULT_MODEL_ID),
+                    columnDefs=[],
                     eventListeners={
                         "filterChanged": ["onGridFilterChanged(params)"],
+                        "columnVisible": ["onGridColumnStateChanged(params)"],
+                        "columnPinned": ["onGridColumnStateChanged(params)"],
+                        "columnMoved": ["onGridColumnStateChanged(params)"],
+                        "columnRowGroupChanged": ["onGridColumnStateChanged(params)"],
+                        "columnPivotChanged": ["onGridColumnStateChanged(params)"],
+                        "columnValueChanged": ["onGridColumnStateChanged(params)"],
                     },                    
                     dangerously_allow_code=True,
                     defaultColDef={
@@ -999,6 +2029,71 @@ app.layout = html.Div(
         ),
     ],
 )
+
+
+@app.callback(
+    Output("schema-selector", "options"),
+    Output("schema-selector", "value"),
+    Input("catalog-selector", "value"),
+    State("schema-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_catalog_change(catalog: str | None, current_schema: str | None):
+    schema_options = get_schema_dropdown_options_from_matrix(catalog)
+    next_schema = None
+    return schema_options, next_schema
+
+
+@app.callback(
+    Output("model-selector", "options"),
+    Output("model-selector", "value"),
+    Output("server-filter-input", "value", allow_duplicate=True),
+    Output("manual-filter-store", "data", allow_duplicate=True),
+    Output("filter-parse-message", "children", allow_duplicate=True),
+    Input("catalog-selector", "value"),
+    Input("schema-selector", "value"),
+    State("model-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_namespace_change_update_models(
+    catalog: str | None,
+    schema: str | None,
+    current_model_id: str | None,
+):
+    empty_state = {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}}
+
+    if not catalog or not schema:
+        return [], None, "{}", empty_state, "Select a catalog and schema."
+
+    options = get_model_dropdown_options_from_matrix(catalog, schema)
+    next_model = None
+    return options, next_model, "{}", empty_state, ""
+
+
+@app.callback(
+    Output("report-selector", "options"),
+    Output("report-selector", "value"),
+    Output("active-report-store", "data"),
+    Input("catalog-selector", "value"),
+    Input("schema-selector", "value"),
+    Input("model-selector", "value"),
+    State("report-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_model_or_namespace_or_report_change(
+    catalog: str | None,
+    schema: str | None,
+    model_id: str | None,
+    selected_report_id: str | None,
+):
+    options = get_report_dropdown_options(model_id or "", catalog, schema)
+    values = {o["value"] for o in options}
+    next_report_id = selected_report_id if selected_report_id in values else None
+    active_report = {
+        "id": next_report_id,
+        "timestamp": pd.Timestamp.utcnow().isoformat(),
+    }
+    return options, next_report_id, active_report
 
 
 @app.callback(
@@ -1034,6 +2129,51 @@ def on_filter_json_modal_toggle(open_clicks, close_x_clicks, manual_filter_data)
             if isinstance(candidate, dict):
                 filters = candidate
         return shown, json.dumps(filters, indent=2)
+
+    return hidden, no_update
+
+
+@app.callback(
+    Output("report-filter-json-modal", "style"),
+    Output("report-filter-editor", "value"),
+    Input("open-report-filter-json-btn", "n_clicks"),
+    Input("close-report-filter-json-x-btn", "n_clicks"),
+    State("active-report-store", "data"),
+    State("report-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_report_filter_json_modal_toggle(open_clicks, close_x_clicks, active_report_data, report_selector_value):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2000,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    if triggered == "open-report-filter-json-btn.n_clicks":
+        selected_report_id = ""
+        if isinstance(active_report_data, dict):
+            selected_report_id = str(active_report_data.get("id") or "")
+        if not selected_report_id:
+            selected_report_id = str(report_selector_value or "")
+
+        report_filters = {}
+        if selected_report_id and selected_report_id in REPORT_DEFS:
+            report_filters = REPORT_DEFS[selected_report_id].get("filters") or {}
+            if not isinstance(report_filters, dict):
+                report_filters = {}
+
+        return shown, json.dumps(report_filters, indent=2)
 
     return hidden, no_update
 
@@ -1085,23 +2225,154 @@ def sync_value_help_context(model_id: str, field_name: str | None):
 
 
 @app.callback(
-    Output("server-filter-input", "value", allow_duplicate=True),
+    Output("field-filter-modal", "style"),
+    Output("field-filter-modal-include-input", "value"),
+    Output("field-filter-modal-exclude-input", "value"),
+    Output("field-filter-modal-title", "children"),
+    Output("field-filter-modal-context", "data"),
     Input("apply-field-filter-btn", "n_clicks"),
-    Input("clear-field-filter-btn", "n_clicks"),
-    State("field-filter-selector", "value"),
-    State("field-filter-include-input", "value"),
-    State("field-filter-exclude-input", "value"),
+    Input("close-field-filter-modal-btn", "n_clicks"),
+    Input("cancel-field-filter-modal-btn", "n_clicks"),
+    Input("apply-field-filter-modal-btn", "n_clicks"),
+    Input("clear-field-filter-modal-btn", "n_clicks"),
+    Input("field-filter-modal-include-input", "n_submit"),
+    Input("field-filter-modal-exclude-input", "n_submit"),
+    State("field-filter-active-model", "value"),
+    State("field-filter-dimension-selector", "value"),
+    State("field-filter-dimension-selector", "options"),
+    State("field-filter-active-field", "value"),
+    State("field-filter-selector", "options"),
+    State("field-filter-modal-include-input", "value"),
+    State("field-filter-modal-exclude-input", "value"),
+    State("server-filter-input", "value"),
+    prevent_initial_call=True,
+)
+def on_set_filter_modal_toggle(
+    open_clicks,
+    close_clicks,
+    cancel_clicks,
+    apply_clicks,
+    clear_clicks,
+    include_submit,
+    exclude_submit,
+    model_id,
+    dimension_name,
+    dimension_options,
+    field_name,
+    field_options,
+    include_csv,
+    exclude_csv,
+    current_filter_json,
+):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2100,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    if triggered == "apply-field-filter-btn.n_clicks":
+        if not field_name:
+            return hidden, "", "", "Set Dimension Filter", {}
+
+        field_label = str(field_name)
+        dimension_label = str(dimension_name or "")
+
+        if isinstance(dimension_options, list):
+            for opt in dimension_options:
+                if isinstance(opt, dict) and str(opt.get("value")) == str(dimension_name):
+                    dimension_label = str(opt.get("label") or dimension_label)
+                    break
+
+        if isinstance(field_options, list):
+            for opt in field_options:
+                if isinstance(opt, dict) and str(opt.get("value")) == str(field_name):
+                    field_label = str(opt.get("label") or field_name)
+                    break
+
+        if dimension_label:
+            title = f"Set Filter for: {dimension_label} / {field_label}"
+        else:
+            title = f"Set Filter for: {field_label}"
+
+        modal_context = {
+            "model_id": str(model_id or ""),
+            "dimension_name": str(dimension_name or ""),
+            "dimension_label": str(dimension_label or ""),
+            "field_name": str(field_name or ""),
+            "field_label": str(field_label or ""),
+        }
+
+        include_values: list[str] = []
+        exclude_values: list[str] = []
+        try:
+            current = json.loads((current_filter_json or "{}").strip())
+            if isinstance(current, dict):
+                spec = current.get(field_name) or {}
+                if isinstance(spec, dict):
+                    include_values = [str(v) for v in (spec.get("in") or []) if v not in (None, "")]
+                    exclude_values = [str(v) for v in (spec.get("not_in") or []) if v not in (None, "")]
+        except Exception:
+            pass
+
+        return shown, ", ".join(include_values), ", ".join(exclude_values), title, modal_context
+
+    if triggered == "clear-field-filter-modal-btn.n_clicks":
+        # Clear only the popup CSV inputs; do not mutate applied server filters.
+        return shown, "", "", no_update, no_update
+
+    if triggered in {
+        "apply-field-filter-modal-btn.n_clicks",
+        "field-filter-modal-include-input.n_submit",
+        "field-filter-modal-exclude-input.n_submit",
+    }:
+        include_vals = _split_csv_values(include_csv)
+        exclude_vals = _split_csv_values(exclude_csv)
+        if "?" in include_vals or "?" in exclude_vals:
+            return shown, no_update, no_update, no_update, no_update
+        return hidden, no_update, no_update, no_update, no_update
+
+    return hidden, no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output("server-filter-input", "value", allow_duplicate=True),
+    Input("apply-field-filter-modal-btn", "n_clicks"),
+    Input("field-filter-modal-include-input", "n_submit"),
+    Input("field-filter-modal-exclude-input", "n_submit"),
+    State("field-filter-active-field", "value"),
+    State("field-filter-modal-context", "data"),
+    State("field-filter-modal-include-input", "value"),
+    State("field-filter-modal-exclude-input", "value"),
     State("server-filter-input", "value"),
     prevent_initial_call=True,
 )
 def on_field_filter_apply_or_clear(
     apply_clicks,
-    clear_clicks,
-    field_name,
+    include_submit,
+    exclude_submit,
+    active_field_name,
+    modal_context,
     include_csv,
     exclude_csv,
     current_filter_json,
 ):
+    field_name = ""
+    if isinstance(modal_context, dict):
+        field_name = str(modal_context.get("field_name") or "")
+    if not field_name:
+        field_name = str(active_field_name or "")
+
     if not field_name:
         return no_update
 
@@ -1115,12 +2386,11 @@ def on_field_filter_apply_or_clear(
     ctx = dash.callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
 
-    if triggered == "clear-field-filter-btn.n_clicks":
-        current.pop(field_name, None)
-        return json.dumps(current, indent=2)
-
     include_vals = _split_csv_values(include_csv)
     exclude_vals = _split_csv_values(exclude_csv)
+
+    if "?" in include_vals or "?" in exclude_vals:
+        return no_update
 
     include_set = set(include_vals)
     exclude_vals = [v for v in exclude_vals if v not in include_set]
@@ -1136,6 +2406,146 @@ def on_field_filter_apply_or_clear(
         current[field_name] = spec
 
     return json.dumps(current, indent=2)
+
+
+@app.callback(
+    Output("field-filter-values-modal", "style"),
+    Output("field-filter-values-checklist", "options"),
+    Output("field-filter-values-checklist", "value"),
+    Output("field-filter-values-target", "data"),
+    Output("field-filter-values-empty-note", "children"),
+    Output("field-filter-values-title", "children"),
+    Input("apply-field-filter-modal-btn", "n_clicks"),
+    Input("field-filter-modal-include-input", "n_submit"),
+    Input("field-filter-modal-exclude-input", "n_submit"),
+    State("field-filter-modal-context", "data"),
+    State("field-filter-modal-include-input", "value"),
+    State("field-filter-modal-exclude-input", "value"),
+    prevent_initial_call=True,
+)
+def on_field_filter_values_modal_toggle(
+    apply_clicks,
+    include_submit,
+    exclude_submit,
+    modal_context,
+    include_csv,
+    exclude_csv,
+):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2200,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    include_vals = _split_csv_values(include_csv)
+    exclude_vals = _split_csv_values(exclude_csv)
+    if "?" not in include_vals and "?" not in exclude_vals:
+        return hidden, no_update, no_update, no_update, no_update, no_update
+
+    target_mode = "include" if "?" in include_vals else "exclude"
+
+    model_id = ""
+    field_name = ""
+    dimension_label = ""
+    field_label = ""
+    if isinstance(modal_context, dict):
+        model_id = str(modal_context.get("model_id") or "")
+        field_name = str(modal_context.get("field_name") or "")
+        dimension_label = str(modal_context.get("dimension_label") or "")
+        field_label = str(modal_context.get("field_label") or "")
+
+    if field_label and dimension_label:
+        title = f"Valid Values for: {dimension_label} / {field_label}"
+    elif field_label:
+        title = f"Valid Values for: {field_label}"
+    else:
+        title = "Valid Values"
+
+    if not model_exists(model_id) or not field_name:
+        return shown, [], [], {"mode": target_mode}, "No values available.", title
+
+    try:
+        values = get_backend(model_id).filter_values(field_name, max_values=500)
+    except Exception:
+        LOGGER.warning("Failed to fetch value-help values for field=%s", field_name, exc_info=True)
+        values = []
+
+    options = [{"label": str(v), "value": str(v)} for v in values if v not in (None, "")]
+    note = "No values found for this field." if not options else ""
+    return shown, options, [], {"mode": target_mode}, note, title
+
+
+@app.callback(
+    Output("field-filter-values-modal", "style", allow_duplicate=True),
+    Output("field-filter-modal-include-input", "value", allow_duplicate=True),
+    Output("field-filter-modal-exclude-input", "value", allow_duplicate=True),
+    Input("apply-field-filter-values-btn", "n_clicks"),
+    Input("close-field-filter-values-modal-btn", "n_clicks"),
+    State("field-filter-values-checklist", "value"),
+    State("field-filter-values-target", "data"),
+    State("field-filter-modal-include-input", "value"),
+    State("field-filter-modal-exclude-input", "value"),
+    prevent_initial_call=True,
+)
+def on_field_filter_values_modal_apply_or_close(
+    apply_clicks,
+    close_clicks,
+    selected_values,
+    target_data,
+    include_csv,
+    exclude_csv,
+):
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2200,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    if triggered == "close-field-filter-values-modal-btn.n_clicks":
+        return hidden, no_update, no_update
+
+    values = [str(v) for v in (selected_values or []) if str(v).strip()]
+
+    def _replace_question_placeholder(csv_value: str | None, replacements: list[str]) -> str:
+        tokens = [p.strip() for p in (csv_value or "").split(",")]
+        has_placeholder = False
+        output: list[str] = []
+        for token in tokens:
+            if not token:
+                continue
+            if token == "?":
+                has_placeholder = True
+                output.extend(replacements)
+            else:
+                output.append(token)
+        if not has_placeholder:
+            output.extend(replacements)
+        return ", ".join(output)
+
+    mode = "include"
+    if isinstance(target_data, dict):
+        mode = str(target_data.get("mode") or "include")
+
+    if mode == "exclude":
+        return hidden, include_csv or "", _replace_question_placeholder(exclude_csv, values)
+    return hidden, _replace_question_placeholder(include_csv, values), exclude_csv or ""
 
 
 @app.callback(
@@ -1169,7 +2579,15 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
             filter_button_label(0),
         )
 
-    parsed, error = parse_manual_filters(filter_text, get_model(model_id))
+    if not model_exists(model_id):
+        return (
+            {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}},
+            "",
+            {"minWidth": "240px", "fontSize": "13px", "color": "#374151"},
+            filter_button_label(0),
+        )
+
+    parsed, error = parse_manual_filters(filter_text, get_mv_def(model_id))
     if error:
         return (
             no_update,
@@ -1190,13 +2608,27 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
     Output("olap-grid", "rowData"),
     Output("olap-grid", "columnDefs"),
     Output("logged-in-user", "children"),
+    Input("catalog-selector", "value"),
+    Input("schema-selector", "value"),
     Input("model-selector", "value"),
+    Input("report-selector", "value"),
     Input("max-rows-input", "value"),
+    Input("active-report-store", "data"),
     Input("olap-grid", "columnState"),
+    Input("column-change-trigger", "data"),
     Input("filter-change-trigger", "data"),
     Input("manual-filter-store", "data"),
 )
-def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_trigger, manual_filter_data):
+def on_grid_state_change(catalog_value, 
+                         schema_value, 
+                         model_id: str, 
+                         report_id, 
+                         max_rows_value, 
+                         active_report_data, 
+                         column_state, 
+                         column_trigger, 
+                         filter_trigger, 
+                         manual_filter_data):
     """
     Single unified callback — fires on every grid state change:
       - model selector, max rows, column grouping/pivot, filter selections.
@@ -1206,13 +2638,26 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
     """
     ctx = dash.callback_context
     triggered = {t["prop_id"] for t in ctx.triggered}
+    LOGGER.info(f"Grid state change triggered by: {triggered}")
 
-    print(f"[on_grid_state_change] triggered={triggered}", flush=True)
+    # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
+    if catalog_value is None or schema_value is None or model_id is None or \
+       report_id is None or max_rows_value is None:
+        return [], [], "Unknown user"
+
+    print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
     print(f"[on_grid_state_change] manual_filter_data={manual_filter_data}", flush=True)
 
+    effective_column_state = column_state
+    if isinstance(column_trigger, dict):
+        candidate = column_trigger.get("columnState")
+        if isinstance(candidate, list):
+            effective_column_state = candidate
+            print(f"[on_grid_state_change] using columnState from Store: {effective_column_state}", flush=True)
+
     filter_model = {}
-    
+
     # Try Store first
     if isinstance(filter_trigger, dict):
         candidate = filter_trigger.get("filterModel")
@@ -1225,12 +2670,50 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
         candidate = manual_filter_data.get("filters")
         if isinstance(candidate, dict):
             manual_filters = candidate
-    
-    selected_model = get_model(model_id)
-    rebuild_cols = "model-selector.value" in triggered
-    request = build_default_request(selected_model, sanitize_max_rows(max_rows_value)) if rebuild_cols else build_request_from_grid_state(column_state, max_rows_value)
-    request.filters = build_filters_from_filter_model(filter_model)
-    request.filters.update(manual_filters)
+
+    if not catalog_value or not schema_value or not model_exists(model_id):
+        return [], [], "Unknown user"
+
+    if report_id in (None, ""):
+        return [], [], "Unknown user"
+
+    selected_model = get_mv_def(model_id)
+    max_rows = sanitize_max_rows(max_rows_value)
+    rebuild_cols = (
+        "model-selector.value" in triggered
+        or "report-selector.value" in triggered
+        or "active-report-store.data" in triggered
+    )
+    selected_report_id = ""
+    if isinstance(active_report_data, dict):
+        selected_report_id = str(active_report_data.get("id") or "")
+
+    if not selected_report_id:
+        selected_report_id = str(report_id or "")
+
+    report_def = REPORT_DEFS.get(selected_report_id)
+
+    runtime_filters: dict[str, dict[str, list] | list] = {}
+    runtime_filters.update(build_filters_from_filter_model(filter_model))
+    runtime_filters.update(manual_filters)
+
+    if report_def is not None:
+        request = _report_request(
+            selected_model,
+            report_def,
+            max_rows,
+            column_state=effective_column_state,
+            extra_filters=runtime_filters,
+        )
+    else:
+        request = (
+            build_default_request(selected_model, max_rows)
+            if rebuild_cols
+            else build_request_from_grid_state(effective_column_state, max_rows)
+        )
+        merged_filters: dict[str, dict[str, list] | list] = dict(request.filters or {})
+        merged_filters.update(runtime_filters)
+        request.filters = merged_filters
 
     LOGGER.info(
         "Grid state change: model=%s rows=%s pivots=%s filters=%s max_rows=%s trigger=%s raw_filter_model=%s",
@@ -1245,10 +2728,21 @@ def on_grid_state_change(model_id: str, max_rows_value, column_state, filter_tri
 
     result_df = get_backend(model_id).execute(request)
 
-    # Rebuild column defs only when model changes.
+    # Rebuild column defs only when model/report changes.
     # Rebuilding defs on columnState events can cause AG Grid to emit a second
     # columnState change while it reapplies column metadata.
-    new_col_defs = build_column_defs(result_df, selected_model, model_id) if rebuild_cols else dash.no_update
+    if rebuild_cols:
+        # When a report is active, visible_fields should come from report YAML
+        # semantics (request rows + keyfigures), not from backend result shape.
+        # This keeps the default view aligned with report defaults.
+        report_visible: set[str] | None = None
+        if report_def is not None:
+            requested_fields = set(request.rows or []).union(set(request.metrics or []))
+            base_visible = requested_fields if requested_fields else get_default_visible_fields(selected_model)
+            report_visible = base_visible
+        new_col_defs = build_column_defs(result_df, selected_model, visible_fields=report_visible)
+    else:
+        new_col_defs = dash.no_update
 
     return result_df.to_dict("records"), new_col_defs, get_logged_in_user(model_id)
 

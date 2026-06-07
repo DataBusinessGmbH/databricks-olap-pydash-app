@@ -17,10 +17,11 @@ from dataclasses import dataclass, field
 import importlib
 import logging
 import os
+import re
 from typing import Callable, Protocol
 from databricks.connect import DatabricksSession
 import pandas as pd
-from src.model import OlapModel
+from src.model import MetricViewDef
 
 def _setup_logger() -> logging.Logger:
     level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
@@ -91,6 +92,7 @@ class OlapQueryRequest:
     rows: list[str] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
     metrics: list[str] = field(default_factory=list)
+    metric_aggs: dict[str, str] = field(default_factory=dict)
     filters: dict[str, dict[str, list] | list] = field(default_factory=dict)
     max_rows: int | None = None
 
@@ -99,174 +101,92 @@ class OlapQueryRequest:
 # ---------------------------------------------------------------------------
 class OlapProcessor:
     """
-    Shared OLAP processor that:
-    - Builds SQL for OLAP operations
-    - Executes common operations (`execute`, `current_user`, `filter_values`)
-      via backend-specific `execute_sql()` function.
+    Shared OLAP processor backed by a MetricViewDef.
+
+    The metric view is queried directly as a single table — no joins to
+    underlying dimension tables are performed.  Dimension attributes and
+    measures are all columns on the metric view.
     """
 
     def __init__(
         self,
-        model: OlapModel,
+        mv_def: MetricViewDef,
         config: DatabricksConnectionConfig,
         execute_sql_fn: Callable[[str], pd.DataFrame],
         backend_label: str,
     ) -> None:
-        self._model = model
+        self._mv = mv_def
         self._config = config
         self._execute_sql = execute_sql_fn
         self._backend_label = backend_label
 
     def build_sql(self, request: OlapQueryRequest | None = None) -> str:
         """
-        Build SQL query with only requested dimensions and metrics.
-        
-        If request is None, builds flat table with all dimensions (legacy behavior).
-        If request has empty rows/columns, also builds with all dimensions (initial state).
-        Otherwise, only includes dimensions in rows/columns and specified metrics.
+        Build a SELECT … FROM <metric_view> … GROUP BY … query.
+
+        - When request is None or rows/columns are empty: include all fields.
+        - Otherwise: include only the requested dimension fields and metrics.
+        - All filters apply directly on metric-view columns.
         """
+        mv = self._mv
         fact_alias = "f"
+        q = self._q
         select_cols: list[str] = []
         group_by_cols: list[str] = []
         where_clauses: list[str] = []
-        join_sql = []
+
+        requested_rows: set[str] = set()
+        requested_metrics: set[str] = set()
+        if request:
+            requested_rows.update(request.rows or [])
+            requested_rows.update(request.columns or [])
+            requested_metrics.update(request.metrics or [])
+
+        include_all = request is None or (not request.rows and not request.columns)
 
         LOGGER.info(
-            "Building SQL for request: rows=%s columns=%s metrics=%s filters=%s",
-            request.rows if request else None,
-            request.columns if request else None,
-            request.metrics if request else None,
-            request.filters.keys() if request and request.filters else None            
+            "Building SQL for request: rows=%s metrics=%s filters=%s",
+            requested_rows or "(all)",
+            requested_metrics or "(all)",
+            list((request.filters or {}).keys()) if request else None,
         )
 
-        # Determine which dimension attributes are needed
-        requested_cols = set()
-        if request:
-            requested_cols.update(request.rows)
-            requested_cols.update(request.columns)
-
-        filter_fields = set((request.filters or {}).keys()) if request else set()
-
-        # If request is None or both rows/columns are empty, include all dimensions (flat table state)
-        include_all_dims = request is None or (not request.rows and not request.columns)
-
-        # Keep fact join keys as non-aggregated columns.
-        if 1==2:
-            for key in self._model.fact.join_keys:
-                expr = f"{fact_alias}.{self._q(key)}"
-                select_cols.append(f"{expr} AS {self._q(key)}")
+        # Dimension fields — all come directly from the metric view
+        for f in mv.dimension_fields:
+            if include_all or f.name in requested_rows:
+                expr = f"{fact_alias}.{q(f.name)}"
+                select_cols.append(f"{expr} AS {q(f.name)}")
                 group_by_cols.append(expr)
-
-
-        # Only include dimensions whose attributes are requested
-        dim_idx = 0
-        for dim in self._model.dimensions:
-            # Check if any attribute from this dimension is requested
-            dim_attrs_to_include = []
-            dim_key_include = False            
-            attr_names = {a.name for a in dim.attributes}
-            dim_filter_attr_names = [a for a in attr_names if a in filter_fields]
-            
-            if include_all_dims:
-                # Include all attributes (flat table or no drilldown yet)
-                dim_attrs_to_include = [a.name for a in dim.attributes]
-            else:
-                # Only include attributes that are in requested columns
-                dim_attrs_to_include = [a.name for a in dim.attributes if a.name in requested_cols]
-
-            # Synthetic display key (alias of fact foreign key) — include if dimension is used
-            if dim.dim_key in requested_cols or include_all_dims==True :
-                display_key_expr = f"{fact_alias}.{self._q(dim.fact_key)}"
-                select_cols.append(
-                    f"{display_key_expr} AS {self._q(dim.dim_key)}"
+            if request and request.filters and f.name in request.filters:
+                where_sql = self._filter_sql(
+                    f"{fact_alias}.{q(f.name)}", request.filters[f.name]
                 )
-                group_by_cols.append(display_key_expr)      
-                dim_key_include = True  # Flag to indicate we need to join this dimension
+                if where_sql:
+                    where_clauses.append(where_sql)
 
-            # If any attribute from this dimension is requested, we also need to join the dimension
-            if len(dim_attrs_to_include)>0:
-                dim_key_include = True  # Flag to indicate we need to join this dimension
-
-
-            # key filters on dim key/display key are applied against fact foreign key
-            if request and request.filters:
-                for key_field in (dim.dim_key, dim.display_key):
-                    if key_field in request.filters and request.filters[key_field]:
-                        where_sql = self._filter_sql(
-                            f"{fact_alias}.{self._q(dim.fact_key)}",
-                            request.filters[key_field],
-                        )
-                        if where_sql:
-                            where_clauses.append(where_sql)
-
-            # Only join dimension if it has attributes to include
-            if not dim_attrs_to_include and not dim_key_include and not dim_filter_attr_names:
-                continue
-            
-            dim_idx += 1
-            d_alias = f"d{dim_idx}"
-            join_sql.append(
-                f"LEFT JOIN {self._qualified_table_name(dim)} {d_alias} "
-                f"ON {fact_alias}.{self._q(dim.fact_key)} = {d_alias}.{self._q(dim.dim_key)}"
-            )
-
-            # Include only requested attributes
-            for attr_name in dim_attrs_to_include:
-                attr_expr = f"{d_alias}.{self._q(attr_name)}"
-                select_cols.append(f"{attr_expr} AS {self._q(attr_name)}")
-                group_by_cols.append(attr_expr)
-
-            # filters on dimension attributes
-            if request and request.filters:
-                for attr_name in dim_filter_attr_names:
-                    where_sql = self._filter_sql(
-                        f"{d_alias}.{self._q(attr_name)}",
-                        request.filters[attr_name],
-                    )
-                    if where_sql:
-                        where_clauses.append(where_sql)
-
-        # filters on fact join keys
-        if request and request.filters:
-            for key in self._model.fact.join_keys:
-                if key in request.filters and request.filters[key]:
-                    where_sql = self._filter_sql(
-                        f"{fact_alias}.{self._q(key)}",
-                        request.filters[key],
-                    )
-                    if where_sql:
-                        where_clauses.append(where_sql)
-
-        # Include only requested metrics (or all if request is None)
-        requested_metrics = set(request.metrics) if request else set()
-        for metric in self._model.metrics:
-            if request is None or not requested_metrics or metric.name in requested_metrics:
-                select_cols.append(
-                    f"SUM({fact_alias}.{self._q(metric.name)}) AS {self._q(metric.name)}"
+        # Measures — use MEASURE() aggregation syntax
+        for f in mv.measures:
+            if include_all or not requested_metrics or f.name in requested_metrics:
+                select_cols.append(f"MEASURE({q(f.name)}) AS {q(f.name)}")
+            if request and request.filters and f.name in request.filters:
+                where_sql = self._filter_sql(
+                    f"{fact_alias}.{q(f.name)}", request.filters[f.name]
                 )
+                if where_sql:
+                    where_clauses.append(where_sql)
 
         sql_parts = [
             "SELECT",
             "  " + ",\n  ".join(select_cols),
-            f"FROM {self._qualified_table_name(self._model.fact)} {fact_alias}",
-            *join_sql,
+            f"FROM {self._qualified_mv_name()} {fact_alias}",
         ]
 
         if where_clauses:
-            sql_parts.extend(
-                [
-                    "WHERE",
-                    "  " + "\n  AND ".join(where_clauses),
-                ]
-            )
+            unique_clauses = list(dict.fromkeys(where_clauses))
+            sql_parts += ["WHERE", "  " + "\n  AND ".join(unique_clauses)]
 
         if group_by_cols:
-            sql_parts.extend(
-                [
-                    "GROUP BY",
-                    "  " + ",\n  ".join(group_by_cols),
-                ]
-            )
+            sql_parts += ["GROUP BY", "  " + ",\n  ".join(group_by_cols)]
 
         max_rows = self._resolve_max_rows(request)
         if max_rows is not None:
@@ -276,80 +196,52 @@ class OlapProcessor:
 
     def build_distinct_values_sql(self, field_name: str, max_values: int = 500) -> str:
         """
-        Build SQL to fetch distinct non-null values for one filter field.
-
-        Supported fields:
-        - Dimension attributes: distinct values via fact left join dimension.
-        - Dimension dim_key/display_key: distinct fact foreign key aliased as field.
-        - Fact join keys: distinct values from fact.
+        Distinct non-null values for one field, queried directly from the metric view.
+        All dimension attributes and keys are columns on the metric view object.
         """
+        if field_name not in self._mv.all_field_names:
+            raise ValueError(f"Unknown field for filter values: {field_name}")
+
         fact_alias = "f"
         max_vals = max_values if isinstance(max_values, int) and max_values > 0 else 500
-        fact_table = self._qualified_table_name(self._model.fact)
+        expr = f"{fact_alias}.{self._q(field_name)}"
+        return "\n".join([
+            "SELECT DISTINCT",
+            f"  {expr} AS {self._q(field_name)}",
+            f"FROM {self._qualified_mv_name()} {fact_alias}",
+            f"WHERE {expr} IS NOT NULL",
+            "ORDER BY 1",
+            f"LIMIT {max_vals}",
+        ])
 
-        for dim in self._model.dimensions:
-            attr_names = {a.name for a in dim.attributes}
-
-            if field_name in attr_names:
-                dim_alias = "d"
-                attr_expr = f"{dim_alias}.{self._q(field_name)}"
-                return "\n".join(
-                    [
-                        "SELECT DISTINCT",
-                        f"  {attr_expr} AS {self._q(field_name)}",
-                        f"FROM {fact_table} {fact_alias}",
-                        (
-                            f"LEFT JOIN {self._qualified_table_name(dim)} {dim_alias} "
-                            f"ON {fact_alias}.{self._q(dim.fact_key)} = {dim_alias}.{self._q(dim.dim_key)}"
-                        ),
-                        f"WHERE {attr_expr} IS NOT NULL",
-                        "ORDER BY 1",
-                        f"LIMIT {max_vals}",
-                    ]
-                )
-
-            if field_name == dim.dim_key or field_name == dim.display_key:
-                fk_expr = f"{fact_alias}.{self._q(dim.fact_key)}"
-                return "\n".join(
-                    [
-                        "SELECT DISTINCT",
-                        f"  {fk_expr} AS {self._q(field_name)}",
-                        f"FROM {fact_table} {fact_alias}",
-                        f"WHERE {fk_expr} IS NOT NULL",
-                        "ORDER BY 1",
-                        f"LIMIT {max_vals}",
-                    ]
-                )
-
-        if field_name in self._model.fact.join_keys:
-            key_expr = f"{fact_alias}.{self._q(field_name)}"
-            return "\n".join(
-                [
-                    "SELECT DISTINCT",
-                    f"  {key_expr} AS {self._q(field_name)}",
-                    f"FROM {fact_table} {fact_alias}",
-                    f"WHERE {key_expr} IS NOT NULL",
-                    "ORDER BY 1",
-                    f"LIMIT {max_vals}",
-                ]
-            )
-
-        raise ValueError(f"Unsupported field for filter values: {field_name}")
-
-    def _qualified_table_name(self, table_def) -> str:
-        parts = [
-            getattr(table_def, "catalog", None) or self._config.default_catalog,
-            getattr(table_def, "schema", None) or self._config.default_schema,
-            table_def.table,
-        ]
-        qualified = ".".join([self._q(p) for p in parts if p])
-        if not qualified:
-            raise RuntimeError("Table name cannot be empty.")
-        return qualified
+    def _qualified_mv_name(self) -> str:
+        mv = self._mv
+        parts = [p for p in [mv.catalog, mv.schema, mv.metric_view_name] if p]
+        if not parts:
+            raise RuntimeError("MetricViewDef has no table name.")
+        return ".".join(self._q(p) for p in parts)
 
     @staticmethod
     def _q(name: str) -> str:
         return f"`{name}`"
+
+    def _normalize_metric_expr(self, expr: str, fact_alias: str) -> str:
+        """Map metric-view source alias references to the generated fact alias."""
+        text = str(expr)
+
+        def repl(match: re.Match[str]) -> str:
+            return f"{fact_alias}.{self._q(match.group(1))}"
+
+        patterns = [
+            r"`source`\.`([^`]+)`",
+            r"`source`\.([A-Za-z_][A-Za-z0-9_]*)",
+            r"\bsource\.`([^`]+)`",
+            r"\bsource\.([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+        for pattern in patterns:
+            text = re.sub(pattern, repl, text)
+
+        return text
 
     @staticmethod
     def _resolve_max_rows(request: OlapQueryRequest | None) -> int | None:
@@ -385,8 +277,8 @@ class OlapProcessor:
         literals = [v for v in literals if v is not None]
         if not literals:
             return None
-        # Keep NULL rows when excluding explicit values.
-        return f"({expr} IS NULL OR CAST({expr} AS STRING) NOT IN ({', '.join(literals)}))"
+        # Normalize NULL to empty string before applying NOT IN filters.
+        return f"(COALESCE(CAST({expr} AS STRING), '') NOT IN ({', '.join(literals)}))"
 
     @classmethod
     def _normalize_filter_spec(cls, spec) -> dict[str, list]:
@@ -427,11 +319,12 @@ class OlapProcessor:
 
     def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
         LOGGER.debug(
-            "%s execute: rows=%s columns=%s metrics=%s filters=%s",
+            "%s execute: rows=%s columns=%s metrics=%s metric_aggs=%s filters=%s",
             self._backend_label,
             request.rows,
             request.columns,
             request.metrics,
+            request.metric_aggs,
             list((request.filters or {}).keys()),
         )
         sql = self.build_sql(request)        
@@ -495,13 +388,13 @@ class DatabricksSparkBackend:
     joins them, and returns pandas DataFrames to the frontend.
     """
 
-    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
-        self._model = model
+    def __init__(self, mv_def: MetricViewDef, config: DatabricksConnectionConfig | None = None) -> None:
+        self._mv = mv_def
         self._config = config or load_databricks_config_from_env()
-        self._processor = OlapProcessor(model, self._config, self.execute_sql, "Spark")
+        self._processor = OlapProcessor(mv_def, self._config, self.execute_sql, "Spark")
         self._flat: pd.DataFrame | None = None  # lazy cache
         self._spark = self._get_spark_session()
-        LOGGER.info("Initialized Spark backend for model=%s", self._model.name)
+        LOGGER.info("Initialized Spark backend for model=%s", self._mv.model_id)
 
     # -- Public interface ----------------------------------------------------
     def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
@@ -531,13 +424,13 @@ class DatabricksSqlBackend:
     """
     Databricks SQL Warehouse backend using `databricks-sql-connector`.
     """
-    def __init__(self, model: OlapModel, config: DatabricksConnectionConfig | None = None) -> None:
-        self._model = model
+    def __init__(self, mv_def: MetricViewDef, config: DatabricksConnectionConfig | None = None) -> None:
+        self._mv = mv_def
         self._config = config or load_databricks_config_from_env()
-        self._processor = OlapProcessor(model, self._config, self.execute_sql, "SQL")
+        self._processor = OlapProcessor(mv_def, self._config, self.execute_sql, "SQL")
         self._flat: pd.DataFrame | None = None
         self._validate_config()
-        LOGGER.info("Initialized SQL backend for model=%s", self._model.name)
+        LOGGER.info("Initialized SQL backend for model=%s", self._mv.model_id)
 
     def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
         return self._processor.execute(request)
@@ -599,7 +492,7 @@ class DatabricksSqlBackend:
 
 
 def create_databricks_backend(
-    model: OlapModel, config: DatabricksConnectionConfig | None = None
+    mv_def: MetricViewDef, config: DatabricksConnectionConfig | None = None
 ) -> OlapDatabase:
     """
     Create backend using env/config mode.
@@ -609,8 +502,8 @@ def create_databricks_backend(
       - sql: Databricks SQL connector
     """
     cfg = config or load_databricks_config_from_env()
-    LOGGER.info("Creating Databricks backend mode=%s for model=%s", cfg.mode, model.name)
+    LOGGER.info("Creating Databricks backend mode=%s for model=%s", cfg.mode, mv_def.model_id)
     if cfg.mode == "sql":
-        return DatabricksSqlBackend(model, cfg)
-    return DatabricksSparkBackend(model, cfg)
+        return DatabricksSqlBackend(mv_def, cfg)
+    return DatabricksSparkBackend(mv_def, cfg)
 

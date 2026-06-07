@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-import yaml
+import yaml 
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +37,7 @@ class MetricDef:
     type: Literal["numeric", "integer"]
     default_agg: str
     allowed_aggs: list[str]
+    expr: str | None = None
     default_show: bool = False  # Ensure this is parsed from YAML
 
 
@@ -102,6 +103,10 @@ class OlapModel:
         return cls._parse(raw, default_name=path.stem)
 
     @classmethod
+    def from_dict(cls, raw: dict, default_name: str = "model") -> "OlapModel":
+        return cls._parse(raw, default_name=default_name)
+
+    @classmethod
     def _parse(cls, raw: dict, default_name: str) -> "OlapModel":
         model_name = raw.get("model_name") or raw.get("name") or default_name
 
@@ -120,6 +125,7 @@ class OlapModel:
                     type=m.get("type", "numeric"),
                     default_agg=m.get("default_agg", "sum"),
                     allowed_aggs=m.get("allowed_aggs", ["sum"]),
+                    expr=m.get("expr"),
                         default_show=bool(m.get("default_show", False)),  # Parse from YAML
                 )
                 for m in rf.get("metrics", [])
@@ -189,3 +195,60 @@ class OlapModel:
     @property
     def metric_names(self) -> set[str]:
         return {m.name for m in self._fact.metrics}
+
+
+# ---------------------------------------------------------------------------
+# MetricViewDef  –  direct representation of a Databricks metric view
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MvField:
+    """One selectable field exposed by a Databricks metric view."""
+    name: str               # column name on the metric view
+    label: str              # human-readable label
+    field_type: str         # "dimension_key" | "dimension_attr" | "measure"
+    group_name: str         # UI panel group: dimension display name, or "Metrics"
+    default_show: bool = True
+
+
+@dataclass
+class MetricViewDef:
+    """
+    Parsed representation of a Databricks metric view.
+
+    Replaces the OlapModel YAML round-trip for metric-view-backed models.
+    All fields are directly queryable from the metric view object; no joins
+    to underlying dimension tables are needed for the main query path.
+    """
+    model_id: str
+    catalog: str
+    schema: str
+    metric_view_name: str   # physical object name — used in FROM clause
+    display_name: str       # human-readable name shown in the UI
+
+    # Ordered list of all selectable fields (dimensions then measures)
+    fields: list[MvField]
+
+    @property
+    def dimension_fields(self) -> list[MvField]:
+        return [f for f in self.fields if f.field_type in ("dimension_key", "dimension_attr")]
+
+    @property
+    def measures(self) -> list[MvField]:
+        return [f for f in self.fields if f.field_type == "measure"]
+
+    @property
+    def all_field_names(self) -> set[str]:
+        return {f.name for f in self.fields}
+
+    @property
+    def groups(self) -> list[str]:
+        """Ordered unique dimension group names (excludes 'Metrics')."""
+        seen: list[str] = []
+        for f in self.fields:
+            if f.group_name != "Metrics" and f.group_name not in seen:
+                seen.append(f.group_name)
+        return seen
+
+    def fields_for_group(self, group_name: str) -> list[MvField]:
+        return [f for f in self.fields if f.group_name == group_name]
