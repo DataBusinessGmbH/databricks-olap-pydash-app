@@ -57,6 +57,7 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
     try:
         access_token = request.headers.get("x-forwarded-access-token")
     except RuntimeError:
+        LOGGER.warning("No request context available to read x-forwarded-access-token header")
         access_token = None
 
     if not access_token:

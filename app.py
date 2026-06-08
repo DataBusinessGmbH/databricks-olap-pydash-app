@@ -80,6 +80,38 @@ def load_env_on_startup() -> None:
 
     os.environ.setdefault("DATABRICKS_BACKEND_MODE", "spark")
 
+    # In local SQL-mode runs, app.yaml env entries are not injected by the
+    # platform runtime, so load them explicitly as fallback defaults.
+    backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "spark").strip().lower()
+    app_yaml_path = BASE_DIR / "app.yaml"
+    if backend_mode == "sql" and app_yaml_path.exists():
+        try:
+            yaml_mod = importlib.import_module("yaml")
+            app_cfg = yaml_mod.safe_load(app_yaml_path.read_text(encoding="utf-8")) or {}
+            env_entries = app_cfg.get("env", []) if isinstance(app_cfg, dict) else []
+
+            loaded_names: list[str] = []
+            for entry in env_entries if isinstance(env_entries, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                value = entry.get("value")
+                if not name or value is None:
+                    continue
+
+                if name not in os.environ:
+                    loaded_names.append(name)
+                os.environ.setdefault(name, str(value))
+
+            if loaded_names:
+                LOGGER.info(
+                    "Loaded %s environment variable(s) from app.yaml for SQL mode: %s",
+                    len(loaded_names),
+                    loaded_names,
+                )
+        except Exception:
+            LOGGER.warning("Failed to load env entries from app.yaml", exc_info=True)
+
 load_env_on_startup()
 
 
@@ -584,7 +616,7 @@ def _report_request(
 
 
 def list_catalog_names() -> list[str]:
-    configured_catalogs = _parse_csv_env("DATABRICKS_REPORTING_CATALOGS")
+    configured_catalogs = _parse_csv_env("PYDASH_APP_REPORTING_CATALOGS")
     if configured_catalogs:
         filtered = _exclude_information_schema(configured_catalogs)
         LOGGER.info("Using configured reporting catalogs from env: %s", filtered)
