@@ -47,13 +47,6 @@ STARTUP_WARNINGS: list[str] = []
 METRIC_VIEW_REGISTRY: dict[str, MetricViewDef] = {}
 
 
-try:
-    tmp_token = flask_request.headers.get("x-forwarded-access-token")
-    LOGGER.info("app.py - No request context available to read x-forwarded-access-token header")
-except RuntimeError:
-    LOGGER.warning("app.py - No request context available to read x-forwarded-access-token header")
-    tmp_token = None
-
 def ensure_logging_visible() -> None:
     """Ensure INFO logs are visible even when Flask preconfigures root logging."""
     level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
@@ -63,7 +56,6 @@ def ensure_logging_visible() -> None:
     root_logger.setLevel(level)
     for handler in root_logger.handlers:
         handler.setLevel(level)
-
 
 ensure_logging_visible()
 
@@ -997,6 +989,14 @@ def load_metric_views(catalog: str, schema: str) -> dict[str, MetricViewDef]:
 
 
 def _run_startup_sql(sql: str) -> pd.DataFrame:
+    LOGGER.info("Running startup SQL: %s", sql)
+
+    try:
+        access_token = flask_request.headers.get("x-forwarded-access-token")
+    except RuntimeError:
+        LOGGER.warning("app.py-_run_startup_sql - No request context available to read x-forwarded-access-token header")
+        access_token = None
+
     cfg = db_layer.load_databricks_config_from_env()
 
     if cfg.mode == "sql":
@@ -2694,6 +2694,15 @@ def on_grid_state_change(catalog_value,
     ctx = dash.callback_context
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
+
+    " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
+    try:
+        access_token = request.headers.get("x-forwarded-access-token")
+        LOGGER.info("on_grid_state_change - Request context available, access token read from header")
+        LOGGER.info("on_grid_state_change - access_token: %s", access_token)
+    except RuntimeError:
+        LOGGER.info("on_grid_state_change - No request context available to read x-forwarded-access-token header")
+        access_token = None    
 
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
