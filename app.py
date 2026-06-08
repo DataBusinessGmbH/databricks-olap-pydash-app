@@ -1064,9 +1064,11 @@ def get_mv_def(model_id: str) -> MetricViewDef:
 
 
 def get_backend(model_id: str) -> OlapDatabase:
+    LOGGER.info("Getting backend for model_id: %s", model_id)
     if not model_exists(model_id):
         raise KeyError(f"Unknown model id: {model_id}")
     if model_id not in DB_CACHE:
+        LOGGER.info("Creating backend for model_id: %s", model_id)
         DB_CACHE[model_id] = create_databricks_backend(get_mv_def(model_id))
     return DB_CACHE[model_id]
 
