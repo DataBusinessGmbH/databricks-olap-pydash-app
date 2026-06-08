@@ -1415,8 +1415,21 @@ def api_filter_values():
         )
         return jsonify({"values": []})
 
+
+def resolve_startup_user() -> str:
+    """Resolve current user at startup so header can be populated immediately."""
+    try:
+        user_df = _run_startup_sql("SELECT current_user() AS current_user")
+        if not user_df.empty and "current_user" in user_df.columns:
+            value = str(user_df.iloc[0]["current_user"]).strip()
+            if value:
+                return value
+    except Exception:
+        LOGGER.warning("Failed to resolve startup current user", exc_info=True)
+    return "Unknown user"
+
 initial_df = pd.DataFrame()
-initial_user = "Unknown user"
+initial_user = resolve_startup_user()
 
 app.layout = html.Div(
     style={
@@ -2643,7 +2656,7 @@ def on_grid_state_change(catalog_value,
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
-        return [], [], "Unknown user"
+        return [], [], initial_user
 
     print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
@@ -2672,10 +2685,10 @@ def on_grid_state_change(catalog_value,
             manual_filters = candidate
 
     if not catalog_value or not schema_value or not model_exists(model_id):
-        return [], [], "Unknown user"
+        return [], [], initial_user
 
     if report_id in (None, ""):
-        return [], [], "Unknown user"
+        return [], [], initial_user
 
     selected_model = get_mv_def(model_id)
     max_rows = sanitize_max_rows(max_rows_value)

@@ -54,7 +54,11 @@ class DatabricksConnectionConfig:
 def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
     from flask import request
-    access_token = request.headers.get("x-forwarded-access-token")
+    try:
+        access_token = request.headers.get("x-forwarded-access-token")
+    except RuntimeError:
+        access_token = None
+
     if not access_token:
         access_token = os.getenv("DATABRICKS_TOKEN")
         LOGGER.info("Using access token from environment variable DATABRICKS_TOKEN")

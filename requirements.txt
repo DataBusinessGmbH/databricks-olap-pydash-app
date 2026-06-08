@@ -7,3 +7,4 @@ PyYAML==6.0.2
 databricks-sdk
 databricks-connect==15.4.*
 pyspark
+flask
