@@ -2697,7 +2697,7 @@ def on_grid_state_change(catalog_value,
 
     " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
     try:
-        access_token = request.headers.get("x-forwarded-access-token")
+        access_token = flask_request.headers.get("x-forwarded-access-token")
         LOGGER.info("on_grid_state_change - Request context available, access token read from header")
         LOGGER.info("on_grid_state_change - access_token: %s", access_token)
     except RuntimeError:
