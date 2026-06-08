@@ -47,6 +47,13 @@ STARTUP_WARNINGS: list[str] = []
 METRIC_VIEW_REGISTRY: dict[str, MetricViewDef] = {}
 
 
+try:
+    tmp_token = flask_request.headers.get("x-forwarded-access-token")
+    LOGGER.info("app.py - No request context available to read x-forwarded-access-token header")
+except RuntimeError:
+    LOGGER.warning("app.py - No request context available to read x-forwarded-access-token header")
+    tmp_token = None
+
 def ensure_logging_visible() -> None:
     """Ensure INFO logs are visible even when Flask preconfigures root logging."""
     level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
