@@ -1090,7 +1090,10 @@ def sanitize_max_rows(value) -> int | None:
 
 
 def get_logged_in_user(model_id: str) -> str:
-    return get_backend(model_id).current_user()
+    user = get_backend(model_id).current_user()
+    LOGGER.info("Current user for model %s: %s", model_id, user)
+    return user if user else "unknown"
+    #return get_backend(model_id).current_user()
 
 
 def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequest:
