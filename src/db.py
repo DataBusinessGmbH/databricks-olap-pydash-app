@@ -57,14 +57,14 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
     try:
         access_token = request.headers.get("x-forwarded-access-token")
     except RuntimeError:
-        LOGGER.warning("No request context available to read x-forwarded-access-token header")
+        LOGGER.warning("load_databricks_config_from_env - No request context available to read x-forwarded-access-token header")
         access_token = None
 
     if not access_token:
         access_token = os.getenv("DATABRICKS_TOKEN")
-        LOGGER.info("Using access token from environment variable DATABRICKS_TOKEN")
+        LOGGER.info("load_databricks_config_from_env - Using access token from environment variable DATABRICKS_TOKEN")
     else:
-        LOGGER.info("Using access token from x-forwarded-access-token header")
+        LOGGER.info("load_databricks_config_from_env -Using access token from x-forwarded-access-token header")
 
     """Load Databricks backend config from environment variables."""
     cfg = DatabricksConnectionConfig(
@@ -506,7 +506,8 @@ class DatabricksSqlBackend:
 
 
 def create_databricks_backend(
-    mv_def: MetricViewDef, config: DatabricksConnectionConfig | None = None
+    mv_def: MetricViewDef, 
+    config: DatabricksConnectionConfig | None = None
 ) -> OlapDatabase:
     """
     Create backend using env/config mode.

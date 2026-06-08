@@ -2699,7 +2699,6 @@ def on_grid_state_change(catalog_value,
     try:
         access_token = flask_request.headers.get("x-forwarded-access-token")
         LOGGER.info("on_grid_state_change - Request context available, access token read from header")
-        LOGGER.info("on_grid_state_change - access_token: %s", access_token)
     except RuntimeError:
         LOGGER.info("on_grid_state_change - No request context available to read x-forwarded-access-token header")
         access_token = None    
