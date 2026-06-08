@@ -6,3 +6,5 @@ env:
     value: 'GOLD'    
   - name: 'MODELS_TABLE_NAME'
     value: 'REPORTINGMODELS'
+  - name: 'DATABRICKS_REPORTING_CATALOGS'
+    value: 'testdata'
