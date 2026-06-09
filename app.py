@@ -70,9 +70,26 @@ def load_env_on_startup() -> None:
     env_path = BASE_DIR / ".env"
 
     if env_path.exists():
+        LOGGER.info("Loading environment variables from %s", env_path)
         try:
             dotenv = __import__("dotenv")
             dotenv.load_dotenv(dotenv_path=env_path, override=False)
+
+            # Logging loaded env vars for visibility (masking sensitive values)
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    name, value = line.split("=", 1)
+                    name = name.strip()
+                    # Strip possible export keyword and whitespace from name, and whitespace from value
+                    if name.lower().startswith("export "):
+                        name = name[7:].strip()
+                    value = value.strip()
+                    if name and value:
+                        display_value = (
+                            "****" if "TOKEN" in name.upper() or "KEY" in name.upper() else value
+                        )
+                        LOGGER.info("Loaded env var: %s=%s", name, os.getenv(name))
+
         except Exception:
             # If python-dotenv is unavailable, continue with existing process env.
             pass
@@ -81,7 +98,8 @@ def load_env_on_startup() -> None:
     # platform runtime, so load them explicitly as fallback defaults.
     backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "sql").strip().lower()
     app_yaml_path = BASE_DIR / "app.yaml"
-    if backend_mode == "sql" and app_yaml_path.exists():
+    if app_yaml_path.exists():
+        LOGGER.info("Loading environment variables from %s", app_yaml_path)
         try:
             yaml_mod = importlib.import_module("yaml")
             app_cfg = yaml_mod.safe_load(app_yaml_path.read_text(encoding="utf-8")) or {}
@@ -99,13 +117,8 @@ def load_env_on_startup() -> None:
                 if name not in os.environ:
                     loaded_names.append(name)
                 os.environ.setdefault(name, str(value))
+                LOGGER.info("Loaded env var from app.yaml: %s=%s", name, value)
 
-            if loaded_names:
-                LOGGER.info(
-                    "Loaded %s environment variable(s) from app.yaml for SQL mode: %s",
-                    len(loaded_names),
-                    loaded_names,
-                )
         except Exception:
             LOGGER.warning("Failed to load env entries from app.yaml", exc_info=True)
     
@@ -641,6 +654,7 @@ def list_catalog_names() -> list[str]:
 
 
 def list_schema_names(catalog: str) -> list[str]:
+    LOGGER.info("Listing schemas for catalog: %s", catalog)
     namespace = _qualified_ident(catalog)
     queries = [
         f"SHOW SCHEMAS IN {namespace}",
@@ -653,8 +667,9 @@ def list_schema_names(catalog: str) -> list[str]:
     for sql in queries:
         try:
             df = _run_startup_sql(sql)
-        except Exception:
+        except Exception as e:
             LOGGER.info("Schema listing query failed for %s: %s", catalog, sql)
+            LOGGER.info("Schema listing query error", exc_info=e)
             continue
 
         if df.empty:
@@ -995,15 +1010,26 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
 
     try:
         access_token = flask_request.headers.get("x-forwarded-access-token")
+        if not access_token:
+            LOGGER.warning("app.py-_run_startup_sql - Empty access token in request header")
+            access_token = cfg.access_token
+        LOGGER.info(
+            "app.py-_run_startup_sql - Retrieved access token from request header: %s , length %s",
+            "Yes" if access_token else "No",
+            len(access_token) if access_token else 0,
+        )
     except RuntimeError:
         LOGGER.warning("app.py-_run_startup_sql - No request context available to read x-forwarded-access-token header")
+        LOGGER.warning("app.py-_run_startup_sql - Will use Token from environment variable if available")
         access_token = cfg.access_token
+
+    LOGGER.info("app.py-_run_startup_sql - Using access token: %s , length %s", "Yes" if access_token else "No", len(access_token) if access_token else 0)
 
     if cfg.mode == "sql":
         missing = [
             key
             for key, value in {
-                "DATABRICKS_SERVER_HOSTNAME": cfg.server_hostname,
+                "DATABRICKS_HOST": cfg.server_hostname,
                 "DATABRICKS_HTTP_PATH": cfg.http_path,
                 "DATABRICKS_TOKEN": access_token,
             }.items()
@@ -1017,7 +1043,7 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
         conn = sql_mod.connect(
             server_hostname=cfg.server_hostname,
             http_path=cfg.http_path,
-            access_token=cfg.access_token,
+            access_token=access_token,
         )
         try:
             cur = conn.cursor()
@@ -2703,14 +2729,6 @@ def on_grid_state_change(catalog_value,
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
-    " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
-    try:
-        access_token = flask_request.headers.get("x-forwarded-access-token")
-        LOGGER.info("on_grid_state_change - Request context available, access token read from header")
-    except RuntimeError:
-        LOGGER.info("on_grid_state_change - No request context available to read x-forwarded-access-token header")
-        access_token = None    
-
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
@@ -2720,6 +2738,7 @@ def on_grid_state_change(catalog_value,
         LOGGER.info("DB_CACHE entries after clear: %s", len(DB_CACHE))
 
         # Refresh the ACCESS_MATRIX_DF
+        LOGGER.info("Initial callback trigger detected. Rebuilding ACCESS_MATRIX_DF.")
         global ACCESS_MATRIX_DF
         METRIC_VIEW_REGISTRY.clear()
         ACCESS_MATRIX_DF = _build_access_matrix()

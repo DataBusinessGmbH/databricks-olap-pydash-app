@@ -84,7 +84,7 @@ Output remains pandas DataFrame.
 
 ## Configuration via env vars
 - `DATA_BACKEND=databricks`
-- `DATABRICKS_SERVER_HOSTNAME`
+- `DATABRICKS_HOST`
 - `DATABRICKS_HTTP_PATH`
 - `DATABRICKS_TOKEN` (or OAuth/service principal flow)
 - `DATABRICKS_CATALOG` / `DATABRICKS_SCHEMA` (optional defaults)

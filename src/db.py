@@ -55,17 +55,18 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
     """Load Databricks backend config from environment variables."""
     cfg = DatabricksConnectionConfig(
-        mode=os.getenv("DATABRICKS_BACKEND_MODE", "spark").strip().lower(),
-        server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
+        mode=os.getenv("DATABRICKS_BACKEND_MODE").strip().lower(),
+        server_hostname=os.getenv("DATABRICKS_HOST"),
         http_path=os.getenv("DATABRICKS_HTTP_PATH"),
         access_token=os.getenv("DATABRICKS_TOKEN"),
         default_catalog=os.getenv("DATABRICKS_DEFAULT_CATALOG"),
         default_schema=os.getenv("DATABRICKS_DEFAULT_SCHEMA"),
     )
     LOGGER.info(
-        "Databricks config loaded: mode=%s, host=%s, catalog=%s, schema=%s",
+        "Databricks config loaded: mode=%s, host=%s, access token=%s, catalog=%s, schema=%s",
         cfg.mode,
         cfg.server_hostname,
+        f"****({len(cfg.access_token)})" if cfg.access_token else None,
         cfg.default_catalog,
         cfg.default_schema,
     )
@@ -463,7 +464,7 @@ class DatabricksSqlBackend:
     def _validate_config(self) -> None:
         missing = []
         if not self._config.server_hostname:
-            missing.append("DATABRICKS_SERVER_HOSTNAME")
+            missing.append("DATABRICKS_HOST")
         if not self._config.http_path:
             missing.append("DATABRICKS_HTTP_PATH")
         if not self._config.access_token:
