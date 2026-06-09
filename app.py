@@ -48,6 +48,7 @@ DEFAULT_MAX_ROWS = 1000
 STARTUP_WARNINGS: list[str] = []
 # In-memory model registry: model_id → MetricViewDef
 METRIC_VIEW_REGISTRY: dict[str, MetricViewDef] = {}
+LOGGED_IN_USER = None
 
 
 def ensure_logging_visible() -> None:
@@ -2837,8 +2838,11 @@ def on_grid_state_change(catalog_value,
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
     logged_in_user = initial_user
-    if triggered == {'.'}:
+    if triggered == {'.'}:        
         LOGGER.info("Initial callback trigger detected.")
+        LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
+        LOGGER.info("Logged in user: %s", LOGGED_IN_USER)
+
         if ACCESS_MATRIX_DF.empty:
             LOGGER.info("Initializing ACCESS_MATRIX_DF in on_grid_state_change request context")
             METRIC_VIEW_REGISTRY.clear()
