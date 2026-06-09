@@ -65,7 +65,7 @@ def load_env_on_startup() -> None:
     Load environment variables from .env automatically.
 
     - If .env exists, load it without overriding already-exported environment vars.
-    - If .env does not exist, default backend mode to spark.
+    - If .env does not exist, default backend mode to sql.
     """
     env_path = BASE_DIR / ".env"
 
@@ -77,9 +77,7 @@ def load_env_on_startup() -> None:
             # If python-dotenv is unavailable, continue with existing process env.
             pass
 
-    os.environ.setdefault("DATABRICKS_BACKEND_MODE", "spark")
-
-    # In local SQL-mode runs, app.yaml env entries are not injected by the
+    # when running locally, app.yaml env entries are not injected by the
     # platform runtime, so load them explicitly as fallback defaults.
     backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "sql").strip().lower()
     app_yaml_path = BASE_DIR / "app.yaml"
@@ -110,6 +108,8 @@ def load_env_on_startup() -> None:
                 )
         except Exception:
             LOGGER.warning("Failed to load env entries from app.yaml", exc_info=True)
+    
+    os.environ.setdefault("DATABRICKS_BACKEND_MODE", "sql")
 
 load_env_on_startup()
 
