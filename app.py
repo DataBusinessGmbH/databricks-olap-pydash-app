@@ -2843,6 +2843,7 @@ def on_grid_state_change(catalog_value,
         LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
         LOGGER.info("Logged in user: %s", LOGGED_IN_USER)
 
+
         if ACCESS_MATRIX_DF.empty:
             LOGGER.info("Initializing ACCESS_MATRIX_DF in on_grid_state_change request context")
             METRIC_VIEW_REGISTRY.clear()
