@@ -56,14 +56,14 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
     """Load Databricks backend config from environment variables."""
     cfg = DatabricksConnectionConfig(
         mode=os.getenv("DATABRICKS_BACKEND_MODE").strip().lower(),
-        server_hostname=os.getenv("DATABRICKS_HOST"),
+        server_hostname=f"https://{os.getenv('DATABRICKS_HOST')}/",
         http_path=os.getenv("DATABRICKS_HTTP_PATH"),
         access_token=os.getenv("DATABRICKS_TOKEN"),
         default_catalog=os.getenv("DATABRICKS_DEFAULT_CATALOG"),
         default_schema=os.getenv("DATABRICKS_DEFAULT_SCHEMA"),
     )
     LOGGER.info(
-        "Databricks config loaded: mode=%s, host=%s, access_token=%s, catalog=%s, schema=%s",
+        "Databricks config loaded: mode=%s, host=%s, %s, catalog=%s, schema=%s",
         cfg.mode,
         cfg.server_hostname,
         f"****({len(cfg.access_token)})" if cfg.access_token else None,
