@@ -33,6 +33,10 @@ from src.db import (
     OlapQueryRequest,
     create_databricks_backend,
 )
+from src.query_planner import (
+    execute_olap_request as planner_execute_olap_request,
+    fetch_filter_values as planner_fetch_filter_values,
+)
 import logging
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1071,7 @@ logging.info("Access matrix built with %s entries", len(ACCESS_MATRIX_DF))
 logging.info("%s", ACCESS_MATRIX_DF)
 
 
-DB_CACHE: dict[str, OlapDatabase] = {}
+BACKEND_EXECUTOR: OlapDatabase = create_databricks_backend()
 
 CATALOG_OPTIONS = get_catalog_dropdown_options_from_matrix()
 INITIAL_CATALOG_VALUE = None
@@ -1090,24 +1094,22 @@ def get_mv_def(model_id: str) -> MetricViewDef:
     return mv_def
 
 
-def get_backend(model_id: str) -> OlapDatabase:
-    LOGGER.info("get_backend -Getting backend for model_id: %s", model_id)
-    if not model_exists(model_id):
-        raise KeyError(f"Unknown model id: {model_id}")
-    LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
-    if model_id not in DB_CACHE:
-        LOGGER.info("get_backend -Creating backend for model_id: %s", model_id)
-        DB_CACHE[model_id] = create_databricks_backend(get_mv_def(model_id))
-        LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
-    else:
-        LOGGER.info("get_backend - Backend for model_id %s found in cache", model_id)
-        LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
-    return DB_CACHE[model_id]
+def get_backend() -> OlapDatabase:
+    return BACKEND_EXECUTOR
+
+def execute_olap_request(model_id: str, request: OlapQueryRequest) -> pd.DataFrame:
+    mv_def = get_mv_def(model_id)
+    return planner_execute_olap_request(get_backend(), mv_def, request)
+
+
+def fetch_filter_values(model_id: str, field_name: str, max_values: int = 500) -> list:
+    mv_def = get_mv_def(model_id)
+    return planner_fetch_filter_values(get_backend(), mv_def, field_name, max_values=max_values)
 
 
 def get_flat_table(model_id: str) -> pd.DataFrame:
     request = OlapQueryRequest(max_rows=DEFAULT_MAX_ROWS)
-    return get_backend(model_id).execute(request)
+    return execute_olap_request(model_id, request)
 
 
 def build_default_request(mv_def: MetricViewDef, max_rows: int | None = None) -> OlapQueryRequest:
@@ -1125,7 +1127,7 @@ def build_default_request(mv_def: MetricViewDef, max_rows: int | None = None) ->
 def get_default_view_table(model_id: str, max_rows: int | None = None) -> pd.DataFrame:
     mv_def = get_mv_def(model_id)
     request = build_default_request(mv_def, max_rows=max_rows or DEFAULT_MAX_ROWS)
-    return get_backend(model_id).execute(request)
+    return execute_olap_request(model_id, request)
 
 
 def get_default_visible_fields(mv_def: MetricViewDef) -> set[str]:
@@ -1162,11 +1164,10 @@ def sanitize_max_rows(value) -> int | None:
     return max_rows if max_rows > 0 else DEFAULT_MAX_ROWS
 
 
-def get_logged_in_user(model_id: str) -> str:
-    user = get_backend(model_id).current_user()
-    LOGGER.info("Current user for model %s: %s", model_id, user)
+def get_logged_in_user() -> str:
+    user = get_backend().current_user()
+    LOGGER.info("Current user: %s", user)
     return user if user else "unknown"
-    #return get_backend(model_id).current_user()
 
 
 def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequest:
@@ -1474,7 +1475,7 @@ def api_filter_values():
         return jsonify({"error": "model_id and field_name are required", "values": []}), 400
 
     try:
-        values = get_backend(model_id).filter_values(field_name, max_values=max_values)
+        values = fetch_filter_values(model_id, field_name, max_values=max_values)
         LOGGER.info(
             "Lazy filter values response: model_id=%s field_name=%s count=%s",
             model_id,
@@ -2565,7 +2566,7 @@ def on_field_filter_values_modal_toggle(
         return shown, [], [], {"mode": target_mode}, "No values available.", title
 
     try:
-        values = get_backend(model_id).filter_values(field_name, max_values=500)
+        values = fetch_filter_values(model_id, field_name, max_values=500)
     except Exception:
         LOGGER.warning("Failed to fetch value-help values for field=%s", field_name, exc_info=True)
         values = []
@@ -2732,12 +2733,14 @@ def on_grid_state_change(catalog_value,
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
+    logged_in_user = get_logged_in_user()
     if triggered == {'.'}:
-        LOGGER.info("Initial callback trigger detected.Clearing DB_CACHE; DB_CACHE entries before clear: %s", len(DB_CACHE))
-        DB_CACHE.clear()
-        LOGGER.info("DB_CACHE entries after clear: %s", len(DB_CACHE))
+        LOGGER.info("Initial callback trigger detected.")
 
-        # Refresh the ACCESS_MATRIX_DF
+        # get current user         
+        LOGGER.info("Initial callback trigger detected. Current logged-in user: %s", logged_in_user)
+
+        # Refresh the ACCESS_MATRIX_DF        
         LOGGER.info("Initial callback trigger detected. Rebuilding ACCESS_MATRIX_DF.")
         global ACCESS_MATRIX_DF
         METRIC_VIEW_REGISTRY.clear()
@@ -2747,7 +2750,7 @@ def on_grid_state_change(catalog_value,
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
-        return [], [], initial_user
+        return [], [], logged_in_user
 
     print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
@@ -2830,7 +2833,7 @@ def on_grid_state_change(catalog_value,
         filter_model,
     )
 
-    result_df = get_backend(model_id).execute(request)
+    result_df = execute_olap_request(model_id, request)
 
     # Rebuild column defs only when model/report changes.
     # Rebuilding defs on columnState events can cause AG Grid to emit a second
@@ -2848,7 +2851,7 @@ def on_grid_state_change(catalog_value,
     else:
         new_col_defs = dash.no_update
 
-    return result_df.to_dict("records"), new_col_defs, get_logged_in_user(model_id)
+    return result_df.to_dict("records"), new_col_defs, get_logged_in_user()
 
 
 if __name__ == "__main__":
