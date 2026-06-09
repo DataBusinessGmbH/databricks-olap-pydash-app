@@ -2228,6 +2228,9 @@ app.layout = html.Div(
 def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
     """Initialize catalog dropdown without triggering SQL before grid callback."""
     global ACCESS_MATRIX_DF
+    global BACKEND_EXECUTOR
+    ACCESS_MATRIX_DF = ACCESS_MATRIX_DF.iloc[0:0].copy()  # Keep columns, clear only rows.
+    BACKEND_EXECUTOR = None  # Reset executor to ensure it is re-initialized with correct user context.
     
     LOGGER.info("initialize_catalog_options called")
     ctx = dash.callback_context
