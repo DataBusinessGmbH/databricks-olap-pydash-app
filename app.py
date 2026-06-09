@@ -991,13 +991,13 @@ def load_metric_views(catalog: str, schema: str) -> dict[str, MetricViewDef]:
 def _run_startup_sql(sql: str) -> pd.DataFrame:
     LOGGER.info("Running startup SQL: %s", sql)
 
+    cfg = db_layer.load_databricks_config_from_env()
+
     try:
         access_token = flask_request.headers.get("x-forwarded-access-token")
     except RuntimeError:
         LOGGER.warning("app.py-_run_startup_sql - No request context available to read x-forwarded-access-token header")
-        access_token = None
-
-    cfg = db_layer.load_databricks_config_from_env()
+        access_token = cfg.access_token
 
     if cfg.mode == "sql":
         missing = [
@@ -1005,7 +1005,7 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
             for key, value in {
                 "DATABRICKS_SERVER_HOSTNAME": cfg.server_hostname,
                 "DATABRICKS_HTTP_PATH": cfg.http_path,
-                "DATABRICKS_TOKEN": cfg.access_token,
+                "DATABRICKS_TOKEN": access_token,
             }.items()
             if not value
         ]
