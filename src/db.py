@@ -53,25 +53,12 @@ class DatabricksConnectionConfig:
 
 def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
-    from flask import request
-    try:
-        access_token = request.headers.get("x-forwarded-access-token")
-    except RuntimeError:
-        LOGGER.warning("load_databricks_config_from_env - No request context available to read x-forwarded-access-token header")
-        access_token = None
-
-    if not access_token:
-        access_token = os.getenv("DATABRICKS_TOKEN")
-        LOGGER.info("load_databricks_config_from_env - Using access token from environment variable DATABRICKS_TOKEN")
-    else:
-        LOGGER.info("load_databricks_config_from_env -Using access token from x-forwarded-access-token header")
-
     """Load Databricks backend config from environment variables."""
     cfg = DatabricksConnectionConfig(
         mode=os.getenv("DATABRICKS_BACKEND_MODE", "spark").strip().lower(),
         server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
         http_path=os.getenv("DATABRICKS_HTTP_PATH"),
-        access_token=access_token,
+        access_token=os.getenv("DATABRICKS_TOKEN"),
         default_catalog=os.getenv("DATABRICKS_DEFAULT_CATALOG"),
         default_schema=os.getenv("DATABRICKS_DEFAULT_SCHEMA"),
     )
