@@ -165,6 +165,7 @@ class DatabricksSqlBackend:
     def _token_from_request_header() -> str:
         token = ""
         try:
+            LOGGER.debug("Attempting to extract token from request headers")
             token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
             user  = flask_request.headers.get("x-forwarded-user"),
             email = flask_request.headers.get("x-forwarded-email"),
