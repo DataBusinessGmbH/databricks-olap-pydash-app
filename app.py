@@ -2698,7 +2698,7 @@ def on_grid_state_change(catalog_value,
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
-    if triggered == {"."}:
+    if triggered == {'.'}:
         LOGGER.info("Initial callback trigger detected; clearing DB cache for a new logon")
         DB_CACHE.clear()
 
