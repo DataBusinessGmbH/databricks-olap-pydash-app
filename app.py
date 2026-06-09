@@ -1067,9 +1067,12 @@ def get_backend(model_id: str) -> OlapDatabase:
     LOGGER.info("get_backend -Getting backend for model_id: %s", model_id)
     if not model_exists(model_id):
         raise KeyError(f"Unknown model id: {model_id}")
+    LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
     if model_id not in DB_CACHE:
         LOGGER.info("get_backend -Creating backend for model_id: %s", model_id)
         DB_CACHE[model_id] = create_databricks_backend(get_mv_def(model_id))
+    else:
+        LOGGER.info("get_backend - Backend for model_id %s found in cache", model_id)
     return DB_CACHE[model_id]
 
 
@@ -2697,12 +2700,13 @@ def on_grid_state_change(catalog_value,
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
-    " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
+    " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
+    " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
+    " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
     if triggered == {'.'}:
-        LOGGER.info("Initial callback trigger detected; clearing DB cache for a new logon")
+        LOGGER.info("Initial callback trigger detected.Clearing DB_CACHE; DB_CACHE entries before clear: %s", len(DB_CACHE))
         DB_CACHE.clear()
-
-   
+        LOGGER.info("DB_CACHE entries after clear: %s", len(DB_CACHE))
 
     " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
     try:
