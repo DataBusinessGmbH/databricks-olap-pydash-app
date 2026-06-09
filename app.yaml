@@ -4,3 +4,7 @@ env:
     value: 'PYDASH_APP_REPORT'
   - name: 'PYDASH_APP_REPORTING_CATALOGS'
     value: 'testdata'
+  - name: 'APP_LOG_LEVEL'
+    value: 'INFO'
+  - name: 'DATABRICKS_REPORTING_CATALOGS'
+    value: 'testdata'

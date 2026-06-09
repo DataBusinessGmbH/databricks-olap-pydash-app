@@ -81,7 +81,7 @@ def load_env_on_startup() -> None:
 
     # In local SQL-mode runs, app.yaml env entries are not injected by the
     # platform runtime, so load them explicitly as fallback defaults.
-    backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "spark").strip().lower()
+    backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "sql").strip().lower()
     app_yaml_path = BASE_DIR / "app.yaml"
     if backend_mode == "sql" and app_yaml_path.exists():
         try:
