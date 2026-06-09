@@ -2837,12 +2837,16 @@ def on_grid_state_change(catalog_value,
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
-    logged_in_user = initial_user
-    if triggered == {'.'}:        
+
+    initial_triggers = {
+        ".",
+        "report-selector.value",
+    }    
+    
+    if triggered.issubset(initial_triggers):        
         LOGGER.info("Initial callback trigger detected.")
         LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
         LOGGER.info("Logged in user: %s", LOGGED_IN_USER)
-
 
         if ACCESS_MATRIX_DF.empty:
             LOGGER.info("Initializing ACCESS_MATRIX_DF in on_grid_state_change request context")
@@ -2853,7 +2857,7 @@ def on_grid_state_change(catalog_value,
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
-        return [], [], logged_in_user
+        return [], [], LOGGED_IN_USER
 
     logged_in_user = get_logged_in_user()
 
@@ -2884,10 +2888,10 @@ def on_grid_state_change(catalog_value,
             manual_filters = candidate
 
     if not catalog_value or not schema_value or not model_exists(model_id):
-        return [], [], initial_user
+        return [], [], LOGGED_IN_USER
 
     if report_id in (None, ""):
-        return [], [], initial_user
+        return [], [], LOGGED_IN_USER
 
     selected_model = get_mv_def(model_id)
     max_rows = sanitize_max_rows(max_rows_value)
