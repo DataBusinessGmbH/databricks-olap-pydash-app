@@ -2202,6 +2202,14 @@ app.layout = html.Div(
 def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
     """Initialize catalog dropdown without triggering SQL before grid callback."""
     global ACCESS_MATRIX_DF
+    
+    LOGGER.info("initialize_catalog_options called")
+    ctx = dash.callback_context
+    triggered = {t["prop_id"] for t in ctx.triggered}
+    LOGGER.info(f"Grid state change triggered by: {triggered}")
+    
+    LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
+    LOGGER.info("Logged in user: %s", LOGGED_IN_USER)    
 
     # Build access matrix lazily in request context so dependent dropdowns can populate.
     if ACCESS_MATRIX_DF.empty:
@@ -2217,8 +2225,7 @@ def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
     if not options:
         options = CATALOG_OPTIONS
     values = {o["value"] for o in options}
-    next_catalog = current_catalog if current_catalog in values else (options[0]["value"] if options else None)
-    return options, next_catalog
+    return options, None
 
 
 @app.callback(
@@ -2231,8 +2238,8 @@ def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
 def on_catalog_change(catalog: str | None, current_schema: str | None):
     schema_options = get_schema_dropdown_options_from_matrix(catalog)
     values = {o["value"] for o in schema_options}
-    next_schema = current_schema if current_schema in values else (schema_options[0]["value"] if schema_options else None)
-    return schema_options, next_schema
+    #next_schema = current_schema if current_schema in values else (schema_options[0]["value"] if schema_options else None)
+    return schema_options, None
 
 
 @app.callback(
@@ -2258,8 +2265,8 @@ def on_namespace_change_update_models(
 
     options = get_model_dropdown_options_from_matrix(catalog, schema)
     values = {o["value"] for o in options}
-    next_model = current_model_id if current_model_id in values else (options[0]["value"] if options else None)
-    return options, next_model, "{}", empty_state, ""
+    #next_model = current_model_id if current_model_id in values else (options[0]["value"] if options else None)
+    return options, None, "{}", empty_state, ""
 
 
 @app.callback(
