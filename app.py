@@ -1024,13 +1024,14 @@ def _run_startup_sql(sql: str) -> pd.DataFrame:
             cur.execute(sql)
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
+            LOGGER.info("Startup SQL returned %s rows and columns: %s", len(rows), cols)
             return pd.DataFrame(rows, columns=cols)
         finally:
             conn.close()
-
-    db_connect = importlib.import_module("databricks.connect")
-    spark = db_connect.DatabricksSession.builder.serverless().getOrCreate()
-    return spark.sql(sql).toPandas()
+    else:
+        db_connect = importlib.import_module("databricks.connect")
+        spark = db_connect.DatabricksSession.builder.serverless().getOrCreate()
+        return spark.sql(sql).toPandas()
 
 
 REPORT_DEFS = load_report_definitions()
