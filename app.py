@@ -2702,6 +2702,14 @@ def on_grid_state_change(catalog_value,
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
+    " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
+    try:
+        access_token = flask_request.headers.get("x-forwarded-access-token")
+        LOGGER.info("on_grid_state_change - Request context available, access token read from header")
+    except RuntimeError:
+        LOGGER.info("on_grid_state_change - No request context available to read x-forwarded-access-token header")
+        access_token = None    
+
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
@@ -2710,13 +2718,11 @@ def on_grid_state_change(catalog_value,
         DB_CACHE.clear()
         LOGGER.info("DB_CACHE entries after clear: %s", len(DB_CACHE))
 
-    " Check if access token is available in request headers (e.g. when running behind a proxy that injects auth tokens). This can be used for auditing, logging, or passing to the backend for auth purposes."
-    try:
-        access_token = flask_request.headers.get("x-forwarded-access-token")
-        LOGGER.info("on_grid_state_change - Request context available, access token read from header")
-    except RuntimeError:
-        LOGGER.info("on_grid_state_change - No request context available to read x-forwarded-access-token header")
-        access_token = None    
+        # Refresh the ACCESS_MATRIX_DF
+        global ACCESS_MATRIX_DF
+        METRIC_VIEW_REGISTRY.clear()
+        ACCESS_MATRIX_DF = _build_access_matrix()
+        LOGGER.info("ACCESS_MATRIX_DF refilled with %s entries", len(ACCESS_MATRIX_DF))
 
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
