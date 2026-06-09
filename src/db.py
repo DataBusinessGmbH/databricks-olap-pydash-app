@@ -200,6 +200,7 @@ class DatabricksSqlBackend:
             "access_token": access_token,
         }
         LOGGER.info("Connection parameters (excluding token): %s", {k: v for k, v in connect_kwargs.items() if k != "access_token"})
+        LOGGER.info("Token length: %d characters", len(access_token))
         if self._config.default_catalog:
             connect_kwargs["catalog"] = self._config.default_catalog
         if self._config.default_schema:
