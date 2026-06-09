@@ -26,7 +26,6 @@ from dash import Dash, Input, Output, State, dcc, html, no_update
 import dash
 
 from src.model import MetricViewDef, MvField
-from src import db as db_layer
 from src.db import (
     LOGGER,
     OlapDatabase,
@@ -100,7 +99,6 @@ def load_env_on_startup() -> None:
 
     # when running locally, app.yaml env entries are not injected by the
     # platform runtime, so load them explicitly as fallback defaults.
-    backend_mode = (os.getenv("DATABRICKS_BACKEND_MODE") or "sql").strip().lower()
     app_yaml_path = BASE_DIR / "app.yaml"
     if app_yaml_path.exists():
         LOGGER.info("Loading environment variables from %s", app_yaml_path)
@@ -126,8 +124,6 @@ def load_env_on_startup() -> None:
         except Exception:
             LOGGER.warning("Failed to load env entries from app.yaml", exc_info=True)
     
-    os.environ.setdefault("DATABRICKS_BACKEND_MODE", "sql")
-
 load_env_on_startup()
 
 
@@ -257,14 +253,6 @@ def _normalize_report_dimension_fields(raw_dimension_fields) -> dict[str, list[s
         if cleaned:
             parsed[str(dim_name).strip()] = cleaned
     return parsed
-
-"""
-def _normalize_aggregation_name(value: str | None) -> str | None:
-    if value is None:
-        return None
-    agg = str(value).strip().lower()
-    return agg if agg else None
-"""
 
 def _parse_keyfigure_expr(value: str) -> str | None:
     text = str(value or "").strip()
@@ -416,7 +404,7 @@ def _unique_options(df: pd.DataFrame, value_col: str) -> list[dict[str, str]]:
 
 def get_catalog_dropdown_options_from_matrix() -> list[dict[str, str]]:
     if ACCESS_MATRIX_DF.empty:
-        return [{"label": c, "value": c} for c in list_catalog_names()]
+        return []
     return _unique_options(ACCESS_MATRIX_DF, "catalog")
 
 
@@ -526,13 +514,9 @@ def _report_request(
                 return f.group_name
         return None
 
-    if column_state:
-        request = build_request_from_grid_state(column_state, max_rows)
-        rows = list(request.rows or [])
-        metrics = list(request.metrics or [])
-    else:
+    def _defaults_from_report() -> tuple[list[str], list[str]]:
         # Prefer explicit report.dimension_fields when initializing from report.
-        rows = []
+        rows: list[str] = []
 
         # Per-group field lists from report.dimension_fields.
         # Keys may be UI group labels ("Dim Customer") or aliases ("dim_customer").
@@ -594,7 +578,7 @@ def _report_request(
         rows = list(dict.fromkeys(rows))
 
         # Metrics / keyfigures
-        metrics = []
+        metrics: list[str] = []
         for entry in (report.get("keyfigures") or []):
             metric_name: str | None = None
             if isinstance(entry, str):
@@ -615,6 +599,20 @@ def _report_request(
             if metric_name and metric_name not in metrics:
                 metrics.append(metric_name)
 
+        return rows, metrics
+
+    if column_state:
+        request = build_request_from_grid_state(column_state, max_rows)
+        rows = list(request.rows or [])
+        metrics = list(request.metrics or [])
+        default_rows, default_metrics = _defaults_from_report()
+        if not rows:
+            rows = default_rows
+        if not metrics:
+            metrics = default_metrics
+    else:
+        rows, metrics = _defaults_from_report()
+
     # Filters
     all_filterable = mv_def.all_field_names
     filters: dict[str, dict[str, list] | list] = {
@@ -631,6 +629,29 @@ def _report_request(
     return OlapQueryRequest(rows=rows, metrics=metrics, filters=filters, max_rows=max_rows)
 
 
+def _build_report_default_column_state(
+    mv_def: MetricViewDef,
+    report: dict[str, Any],
+    max_rows: int | None,
+) -> list[dict[str, Any]]:
+    """Build initial AG Grid columnState from report defaults."""
+    defaults_req = _report_request(mv_def, report, max_rows, column_state=None)
+    row_fields = set(defaults_req.rows or [])
+
+    state: list[dict[str, Any]] = []
+    for field in mv_def.fields:
+        is_row = field.name in row_fields
+        state.append(
+            {
+                "colId": field.name,
+                "rowGroup": is_row,
+                "hide": not is_row,
+                "pivot": False,
+            }
+        )
+    return state
+
+
 def list_catalog_names() -> list[str]:
     configured_catalogs = _parse_csv_env("PYDASH_APP_REPORTING_CATALOGS")
     if configured_catalogs:
@@ -645,7 +666,7 @@ def list_catalog_names() -> list[str]:
 
     for sql in queries:
         try:
-            df = _run_startup_sql(sql)
+            df = _run_sql(sql)
         except Exception:
             LOGGER.info("Catalog listing query failed: %s", sql)
             continue
@@ -670,7 +691,7 @@ def list_schema_names(catalog: str) -> list[str]:
 
     for sql in queries:
         try:
-            df = _run_startup_sql(sql)
+            df = _run_sql(sql)
         except Exception as e:
             LOGGER.info("Schema listing query failed for %s: %s", catalog, sql)
             LOGGER.info("Schema listing query error", exc_info=e)
@@ -758,6 +779,45 @@ def _extract_yaml_from_dataframe(df: pd.DataFrame) -> str | None:
     if df.empty:
         return None
 
+    lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
+
+    # Prefer structured describe output rows such as:
+    # col_name='View Text' (or key='view_text') and YAML in a value-like column.
+    key_col = (
+        lower_to_actual.get("col_name")
+        or lower_to_actual.get("key")
+        or lower_to_actual.get("name")
+    )
+    value_candidates = [
+        lower_to_actual.get("value"),
+        lower_to_actual.get("data_type"),
+        lower_to_actual.get("comment"),
+        lower_to_actual.get("definition"),
+    ]
+    value_cols = [c for c in value_candidates if c]
+
+    if key_col and value_cols:
+        for _, row in df.iterrows():
+            raw_key = row.get(key_col)
+            if pd.isna(raw_key):
+                continue
+
+            key_text = str(raw_key).strip().lower().replace("_", " ")
+            if key_text not in {"view text", "view definition", "metric view text", "definition"}:
+                continue
+
+            for value_col in value_cols:
+                raw_value = row.get(value_col)
+                if not isinstance(raw_value, str):
+                    continue
+                text = raw_value.strip()
+                if not text:
+                    continue
+                if "source:" in text and ("dimensions:" in text or "measures:" in text):
+                    return text
+                # If key identifies view text, return non-empty payload as-is.
+                return text
+
     yaml_col_names = [
         col
         for col in df.columns
@@ -777,22 +837,78 @@ def _extract_yaml_from_dataframe(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _extract_yaml_from_tblproperties(df: pd.DataFrame) -> str | None:
+    """Convert SHOW TBLPROPERTIES key/value rows into a metric-view YAML-like payload."""
+    if df.empty:
+        return None
+
+    lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
+    key_col = lower_to_actual.get("key")
+    value_col = lower_to_actual.get("value")
+    if not key_col or not value_col:
+        return None
+
+    props: dict[str, str] = {}
+    for _, row in df.iterrows():
+        raw_key = row.get(key_col)
+        raw_value = row.get(value_col)
+        if pd.isna(raw_key):
+            continue
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        value = "" if pd.isna(raw_value) else str(raw_value).strip()
+        props[key] = value
+
+    def _parse_json_list(value: str) -> list:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    from_name = props.get("metric_view.from.name", "")
+    from_type = props.get("metric_view.from.type", "")
+    joins = _parse_json_list(props.get("metric_view.joins", ""))
+    dimensions = _parse_json_list(props.get("metric_view.dimensions", ""))
+    measures = _parse_json_list(props.get("metric_view.measures", ""))
+
+    if not from_name and not joins and not dimensions and not measures:
+        return None
+
+    payload: dict[str, Any] = {}
+    if from_name:
+        payload["source"] = {"name": from_name}
+        if from_type:
+            payload["source"]["type"] = from_type
+    if joins:
+        payload["joins"] = joins
+    if dimensions:
+        payload["dimensions"] = dimensions
+    if measures:
+        payload["measures"] = measures
+
+    return _yaml_safe_dump(payload)
+
+
 def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
     namespace = _qualified_ident(catalog, schema)
     escaped_schema = schema.replace("'", "''")
     queries = [
-        f"SHOW METRIC VIEWS IN {namespace}",
         (
             "SELECT table_name "
             f"FROM {_qualified_ident(catalog, 'information_schema', 'tables')} "
             f"WHERE table_schema = '{escaped_schema}' AND upper(table_type) IN ('METRIC_VIEW', 'METRIC VIEW')"
         ),
+        f"SHOW VIEWS IN {namespace}",
     ]
 
     names: set[str] = set()
     for sql in queries:
         try:
-            df = _run_startup_sql(sql)
+            df = _run_sql(sql)
         except Exception:
             LOGGER.info("Metric view discovery query failed: %s", sql)
             continue
@@ -808,6 +924,29 @@ def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
             or lower_to_actual.get("name")
             or df.columns[0]
         )
+        is_metric_col = lower_to_actual.get("ismetric")
+
+        if is_metric_col:
+            for _, row in df.iterrows():
+                raw_is_metric = row.get(is_metric_col)
+                is_metric = False
+                if isinstance(raw_is_metric, bool):
+                    is_metric = raw_is_metric
+                elif raw_is_metric is not None and not pd.isna(raw_is_metric):
+                    is_metric = str(raw_is_metric).strip().lower() in {"true", "1", "yes", "y", "t"}
+
+                if not is_metric:
+                    continue
+
+                raw = row.get(name_col)
+                if pd.isna(raw):
+                    continue
+                metric_view_name = str(raw).strip().strip("`")
+                if metric_view_name:
+                    names.add(metric_view_name)
+            if names:
+                return sorted(names)
+            continue
 
         for raw in df[name_col].tolist():
             if pd.isna(raw):
@@ -815,6 +954,8 @@ def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
             metric_view_name = str(raw).strip().strip("`")
             if metric_view_name:
                 names.add(metric_view_name)
+        if names:
+            return sorted(names)
 
     return sorted(names)
 
@@ -822,40 +963,27 @@ def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
 def _fetch_metric_view_yaml(catalog: str, schema: str, metric_view_name: str) -> str | None:
     qualified_name = _qualified_ident(catalog, schema, metric_view_name)
     queries = [
-        f"DESCRIBE METRIC VIEW {qualified_name}",
+        #f"SHOW TBLPROPERTIES {qualified_name}",
+        #f"DESCRIBE METRIC VIEW {qualified_name}",
         f"DESCRIBE EXTENDED {qualified_name}",
     ]
 
     for sql in queries:
         try:
-            df = _run_startup_sql(sql)
+            df = _run_sql(sql)
         except Exception:
             LOGGER.info("Metric view describe query failed for %s: %s", metric_view_name, sql)
             continue
 
-        yaml_text = _extract_yaml_from_dataframe(df)
+        yaml_text = (
+            _extract_yaml_from_tblproperties(df) if sql.startswith("SHOW TBLPROPERTIES")
+            else _extract_yaml_from_dataframe(df)
+        )
         if yaml_text:
             return yaml_text
 
     return None
 
-"""
-def _to_model_type_from_dim_expr(expr: str) -> str:
-    lowered = str(expr).lower()
-    if any(token in lowered for token in ["date", "time", "timestamp"]):
-        return "date"
-    if any(token in lowered for token in ["id", "count", "qty", "num", "amount", "key"]):
-        return "numeric"
-    return "string"
-"""
-
-"""
-def _to_model_type_from_measure_expr(expr: str) -> str:
-    lowered = str(expr).lower()
-    if any(token in lowered for token in ["count(", "sum(", "avg(", "min(", "max(", "amount", "qty"]):
-        return "numeric"
-    return "numeric"
-"""
 
 def _parse_metric_view_yaml(
     model_id: str,
@@ -1007,78 +1135,30 @@ def load_metric_views(catalog: str, schema: str) -> dict[str, MetricViewDef]:
     return result
 
 
-def _run_startup_sql(sql: str) -> pd.DataFrame:
-    LOGGER.info("Running startup SQL: %s", sql)
-
-    cfg = db_layer.load_databricks_config_from_env()
-
-    try:
-        access_token = flask_request.headers.get("x-forwarded-access-token")
-        if not access_token:
-            LOGGER.warning("app.py-_run_startup_sql - Empty access token in request header")
-            access_token = cfg.access_token
-        LOGGER.info(
-            "app.py-_run_startup_sql - Retrieved access token from request header: %s , length %s",
-            "Yes" if access_token else "No",
-            len(access_token) if access_token else 0,
-        )
-    except RuntimeError:
-        LOGGER.warning("app.py-_run_startup_sql - No request context available to read x-forwarded-access-token header")
-        LOGGER.warning("app.py-_run_startup_sql - Will use Token from environment variable if available")
-        access_token = cfg.access_token
-
-    LOGGER.info("app.py-_run_startup_sql - Using access token: %s , length %s", "Yes" if access_token else "No", len(access_token) if access_token else 0)
-
-    if cfg.mode == "sql":
-        missing = [
-            key
-            for key, value in {
-                "DATABRICKS_HOST": cfg.server_hostname,
-                "DATABRICKS_HTTP_PATH": cfg.http_path,
-                "DATABRICKS_TOKEN": access_token,
-            }.items()
-            if not value
-        ]
-        if missing:
-            LOGGER.warning("Skipping startup Databricks lookup (missing SQL env vars): %s", ", ".join(missing))
-            return pd.DataFrame()
-
-        sql_mod = importlib.import_module("databricks.sql")
-        conn = sql_mod.connect(
-            server_hostname=cfg.server_hostname,
-            http_path=cfg.http_path,
-            access_token=access_token,
-        )
-        try:
-            cur = conn.cursor()
-            cur.execute(sql)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-            LOGGER.info("Startup SQL returned %s rows and columns: %s", len(rows), cols)
-            return pd.DataFrame(rows, columns=cols)
-        finally:
-            conn.close()
-    else:
-        db_connect = importlib.import_module("databricks.connect")
-        spark = db_connect.DatabricksSession.builder.serverless().getOrCreate()
-        return spark.sql(sql).toPandas()
+def _run_sql(sql: str) -> pd.DataFrame:
+    LOGGER.info("Running SQL: %s", sql)
+    return get_backend().execute_sql(sql)
 
 
 REPORT_DEFS = load_report_definitions()
 
-ACCESS_MATRIX_DF = _build_access_matrix()
-logging.info("Access matrix built with %s entries", len(ACCESS_MATRIX_DF))
-logging.info("%s", ACCESS_MATRIX_DF)
+ACCESS_MATRIX_DF = pd.DataFrame(
+    columns=["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"]
+)
+logging.info("Startup: ACCESS_MATRIX_DF initialized empty; matrix will be built in user request context")
 
 
-BACKEND_EXECUTOR: OlapDatabase = create_databricks_backend()
+BACKEND_EXECUTOR: OlapDatabase | None = None
 
-CATALOG_OPTIONS = get_catalog_dropdown_options_from_matrix()
+CATALOG_OPTIONS = [
+    {"label": c, "value": c}
+    for c in _exclude_information_schema(_parse_csv_env("PYDASH_APP_REPORTING_CATALOGS"))
+]
 INITIAL_CATALOG_VALUE = None
-INITIAL_SCHEMA_OPTIONS = get_all_schema_dropdown_options_from_matrix()
+INITIAL_SCHEMA_OPTIONS: list[dict[str, str]] = []
 INITIAL_SCHEMA_VALUE = None
 INITIAL_MODEL_VALUE = None
-INITIAL_MODEL_OPTIONS = get_all_model_dropdown_options_from_matrix()
+INITIAL_MODEL_OPTIONS: list[dict[str, str]] = []
 
 
 def model_exists(model_id: str | None) -> bool:
@@ -1095,6 +1175,9 @@ def get_mv_def(model_id: str) -> MetricViewDef:
 
 
 def get_backend() -> OlapDatabase:
+    global BACKEND_EXECUTOR
+    if BACKEND_EXECUTOR is None:
+        BACKEND_EXECUTOR = create_databricks_backend()
     return BACKEND_EXECUTOR
 
 def execute_olap_request(model_id: str, request: OlapQueryRequest) -> pd.DataFrame:
@@ -1493,20 +1576,8 @@ def api_filter_values():
         return jsonify({"values": []})
 
 
-def resolve_startup_user() -> str:
-    """Resolve current user at startup so header can be populated immediately."""
-    try:
-        user_df = _run_startup_sql("SELECT current_user() AS current_user")
-        if not user_df.empty and "current_user" in user_df.columns:
-            value = str(user_df.iloc[0]["current_user"]).strip()
-            if value:
-                return value
-    except Exception:
-        LOGGER.warning("Failed to resolve startup current user", exc_info=True)
-    return "Unknown user"
-
 initial_df = pd.DataFrame()
-initial_user = resolve_startup_user()
+initial_user = "Unknown user"
 
 app.layout = html.Div(
     style={
@@ -2122,6 +2193,34 @@ app.layout = html.Div(
 
 
 @app.callback(
+    Output("catalog-selector", "options"),
+    Output("catalog-selector", "value"),
+    Input("dismiss-startup-warning-btn", "n_clicks"),
+    State("catalog-selector", "value"),
+)
+def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
+    """Initialize catalog dropdown without triggering SQL before grid callback."""
+    global ACCESS_MATRIX_DF
+
+    # Build access matrix lazily in request context so dependent dropdowns can populate.
+    if ACCESS_MATRIX_DF.empty:
+        try:
+            LOGGER.info("Initializing ACCESS_MATRIX_DF in initialize_catalog_options request context")
+            METRIC_VIEW_REGISTRY.clear()
+            ACCESS_MATRIX_DF = _build_access_matrix()
+            LOGGER.info("ACCESS_MATRIX_DF initialized with %s entries", len(ACCESS_MATRIX_DF))
+        except Exception:
+            LOGGER.warning("Failed to initialize ACCESS_MATRIX_DF during catalog init", exc_info=True)
+
+    options = get_catalog_dropdown_options_from_matrix()
+    if not options:
+        options = CATALOG_OPTIONS
+    values = {o["value"] for o in options}
+    next_catalog = current_catalog if current_catalog in values else (options[0]["value"] if options else None)
+    return options, next_catalog
+
+
+@app.callback(
     Output("schema-selector", "options"),
     Output("schema-selector", "value"),
     Input("catalog-selector", "value"),
@@ -2130,7 +2229,8 @@ app.layout = html.Div(
 )
 def on_catalog_change(catalog: str | None, current_schema: str | None):
     schema_options = get_schema_dropdown_options_from_matrix(catalog)
-    next_schema = None
+    values = {o["value"] for o in schema_options}
+    next_schema = current_schema if current_schema in values else (schema_options[0]["value"] if schema_options else None)
     return schema_options, next_schema
 
 
@@ -2156,7 +2256,8 @@ def on_namespace_change_update_models(
         return [], None, "{}", empty_state, "Select a catalog and schema."
 
     options = get_model_dropdown_options_from_matrix(catalog, schema)
-    next_model = None
+    values = {o["value"] for o in options}
+    next_model = current_model_id if current_model_id in values else (options[0]["value"] if options else None)
     return options, next_model, "{}", empty_state, ""
 
 
@@ -2730,27 +2831,26 @@ def on_grid_state_change(catalog_value,
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
+    global ACCESS_MATRIX_DF
+
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
     " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
-    logged_in_user = get_logged_in_user()
+    logged_in_user = initial_user
     if triggered == {'.'}:
         LOGGER.info("Initial callback trigger detected.")
-
-        # get current user         
-        LOGGER.info("Initial callback trigger detected. Current logged-in user: %s", logged_in_user)
-
-        # Refresh the ACCESS_MATRIX_DF        
-        LOGGER.info("Initial callback trigger detected. Rebuilding ACCESS_MATRIX_DF.")
-        global ACCESS_MATRIX_DF
-        METRIC_VIEW_REGISTRY.clear()
-        ACCESS_MATRIX_DF = _build_access_matrix()
-        LOGGER.info("ACCESS_MATRIX_DF refilled with %s entries", len(ACCESS_MATRIX_DF))
+        if ACCESS_MATRIX_DF.empty:
+            LOGGER.info("Initializing ACCESS_MATRIX_DF in on_grid_state_change request context")
+            METRIC_VIEW_REGISTRY.clear()
+            ACCESS_MATRIX_DF = _build_access_matrix()
+            LOGGER.info("ACCESS_MATRIX_DF initialized with %s entries", len(ACCESS_MATRIX_DF))
 
     # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
         return [], [], logged_in_user
+
+    logged_in_user = get_logged_in_user()
 
     print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
@@ -2805,11 +2905,28 @@ def on_grid_state_change(catalog_value,
     runtime_filters.update(manual_filters)
 
     if report_def is not None:
+        # Honor report defaults unless the callback was explicitly triggered by
+        # column-state interactions (group/pivot/visibility changes).
+        use_grid_state_for_report = (
+            "column-change-trigger.data" in triggered
+            or "olap-grid.columnState" in triggered
+        )
+        report_column_state = effective_column_state if use_grid_state_for_report else None
+        """
+        if report_column_state is None:
+            # Initial presentation: derive column state from report defaults.
+            report_column_state = _build_report_default_column_state(
+                selected_model,
+                report_def,
+                max_rows,
+            )
+        """
+
         request = _report_request(
             selected_model,
             report_def,
             max_rows,
-            column_state=effective_column_state,
+            column_state=report_column_state,
             extra_filters=runtime_filters,
         )
     else:
@@ -2851,7 +2968,7 @@ def on_grid_state_change(catalog_value,
     else:
         new_col_defs = dash.no_update
 
-    return result_df.to_dict("records"), new_col_defs, get_logged_in_user()
+    return result_df.to_dict("records"), new_col_defs, logged_in_user
 
 
 if __name__ == "__main__":

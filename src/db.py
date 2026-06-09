@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from typing import Callable, Protocol
-from databricks.connect import DatabricksSession
+from flask import request as flask_request
 import pandas as pd
 
 def _setup_logger() -> logging.Logger:
@@ -42,7 +42,6 @@ LOGGER = _setup_logger()
 class DatabricksConnectionConfig:
     """Runtime configuration for Databricks access."""
 
-    mode: str = "spark"  # spark | sql
     server_hostname: str | None = None
     http_path: str | None = None
     access_token: str | None = None
@@ -61,7 +60,6 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
     raw_host = raw_host.rstrip("/")
 
     cfg = DatabricksConnectionConfig(
-        mode=(os.getenv("DATABRICKS_BACKEND_MODE") or "sql").strip().lower(),
         server_hostname=raw_host or None,
         http_path=(os.getenv("DATABRICKS_HTTP_PATH") or "").strip() or None,
         access_token=(os.getenv("DATABRICKS_TOKEN") or "").strip() or None,
@@ -69,8 +67,7 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
         default_schema=(os.getenv("DATABRICKS_DEFAULT_SCHEMA") or "").strip() or None,
     )
     LOGGER.info(
-        "Databricks config loaded: mode=%s, host=%s, http_path=%s, token=%s, catalog=%s, schema=%s",
-        cfg.mode,
+        "Databricks config loaded: host=%s, http_path=%s, token=%s, catalog=%s, schema=%s",
         cfg.server_hostname,
         cfg.http_path,
         f"****({len(cfg.access_token)})" if cfg.access_token else None,
@@ -119,50 +116,6 @@ class OlapDatabase(Protocol):
         """Execute raw SQL and return result as DataFrame."""
         ...
 
-# ---------------------------------------------------------------------------
-# Databricks Spark Backend
-# ---------------------------------------------------------------------------
-class DatabricksSparkBackend:
-    """
-    Implements OlapDatabase using tables available in the Databricks workspace
-    where the app is running.
-
-    It reads model table metadata (catalog/schema/table), loads Spark tables,
-    joins them, and returns pandas DataFrames to the frontend.
-    """
-
-    def __init__(self, config: DatabricksConnectionConfig | None = None) -> None:
-        self._config = config or load_databricks_config_from_env()
-        self._spark = self._get_spark_session()
-        LOGGER.info("Initialized Spark backend")
-        current_user = self.current_user()
-        LOGGER.info("Current_user=%s", current_user)
-        
-
-    # -- Public interface ----------------------------------------------------
-    def execute_sql(self, sql: str) -> pd.DataFrame:
-        LOGGER.info("Executing Spark SQL:\n%s", sql)
-        return self._spark.sql(sql).toPandas()
-
-    def current_user(self) -> str:
-        try:
-            user_df = self.execute_sql("SELECT current_user() AS current_user")
-            if not user_df.empty and "current_user" in user_df.columns:
-                return str(user_df.iloc[0]["current_user"])
-        except Exception:
-            LOGGER.warning("Failed to resolve Spark current user", exc_info=True)
-        return "Unknown user"
-
-    # -- Private helpers -----------------------------------------------------
-    @staticmethod
-    def _get_spark_session():
-
-        spark = DatabricksSession.builder.serverless().getOrCreate()
-        if spark is None:
-            raise RuntimeError("No active Spark session found in current runtime.")
-        return spark
-
-
 class DatabricksSqlBackend:
     """
     Databricks SQL Warehouse backend using `databricks-sql-connector`.
@@ -202,13 +155,29 @@ class DatabricksSqlBackend:
             missing.append("DATABRICKS_HOST")
         if not self._config.http_path:
             missing.append("DATABRICKS_HTTP_PATH")
-        if not self._config.access_token:
-            missing.append("DATABRICKS_TOKEN")
         if missing:
             LOGGER.error("SQL backend config missing env vars: %s", ", ".join(missing))
             raise RuntimeError(
                 "Databricks SQL backend missing required env vars: " + ", ".join(missing)
             )
+
+    @staticmethod
+    def _token_from_request_header() -> str:
+        token = ""
+        try:
+            token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
+        except RuntimeError:
+            # No active request context; fallback to env token below.
+            token = ""
+
+        if not token:
+            token = (os.getenv("DATABRICKS_TOKEN") or "").strip()
+
+        if not token:
+            raise RuntimeError(
+                "Missing Databricks access token: provide x-forwarded-access-token header or DATABRICKS_TOKEN env var."
+            )
+        return token
 
     def _connect(self):
         try:
@@ -224,29 +193,26 @@ class DatabricksSqlBackend:
             self._config.server_hostname,
             self._config.http_path,
         )
-        return sql_mod.connect(
-            server_hostname=self._config.server_hostname,
-            http_path=self._config.http_path,
-            access_token=self._config.access_token,
-        )
+        access_token = self._token_from_request_header()
+        connect_kwargs = {
+            "server_hostname": self._config.server_hostname,
+            "http_path": self._config.http_path,
+            "access_token": access_token,
+        }
+        if self._config.default_catalog:
+            connect_kwargs["catalog"] = self._config.default_catalog
+        if self._config.default_schema:
+            connect_kwargs["schema"] = self._config.default_schema
+        return sql_mod.connect(**connect_kwargs)
 
 
 def create_databricks_backend(
     config: DatabricksConnectionConfig | None = None
 ) -> OlapDatabase:
     """
-    Create a Databricks backend executor using env/config mode.
-
-    Modes:
-      - spark (default): workspace Spark session
-      - sql: Databricks SQL connector
+    Create the Databricks SQL backend executor.
     """
     cfg = config or load_databricks_config_from_env()
-    LOGGER.info("Creating Databricks backend mode=%s", cfg.mode)
-    if cfg.mode == "sql":
-        return DatabricksSqlBackend(cfg)
-    elif cfg.mode == "spark":
-        return DatabricksSparkBackend(cfg)
-    else:
-        raise RuntimeError(f"Unsupported Databricks backend mode: {cfg.mode}")
+    LOGGER.info("Creating Databricks SQL backend")
+    return DatabricksSqlBackend(cfg)
 
