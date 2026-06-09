@@ -166,6 +166,9 @@ class DatabricksSqlBackend:
         token = ""
         try:
             token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
+            user  = flask_request.headers.get("x-forwarded-user"),
+            email = flask_request.headers.get("x-forwarded-email"),
+            LOGGER.debug("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
         except RuntimeError:
             # No active request context; fallback to env token below.
             token = ""

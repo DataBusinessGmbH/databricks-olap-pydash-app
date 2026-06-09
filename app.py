@@ -2840,6 +2840,7 @@ def on_grid_state_change(catalog_value,
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
     global ACCESS_MATRIX_DF
+    global LOGGED_IN_USER
 
     " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
     " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
