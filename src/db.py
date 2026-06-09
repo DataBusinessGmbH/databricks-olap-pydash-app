@@ -170,11 +170,11 @@ class DatabricksSqlBackend:
     def _token_from_request_header() -> str:
         token = ""
         try:
-            LOGGER.debug("Attempting to extract token from request headers")
+            LOGGER.info("Attempting to extract token from request headers")
             token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
             user  = flask_request.headers.get("x-forwarded-user"),
             email = flask_request.headers.get("x-forwarded-email"),
-            LOGGER.debug("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
+            LOGGER.info("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
         except RuntimeError:
             # No active request context; fallback to env token below.
             token = ""
