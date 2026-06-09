@@ -51,6 +51,8 @@ class DatabricksConnectionConfig:
 
 def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
+    LOGGER.info("load_databricks_config_from_env called")
+
     # Get token from request header first, then fallback to env var if not present. This allows per-user tokens in a multi-tenant deployment.
     token = DatabricksSqlBackend._token_from_request_header()
 
