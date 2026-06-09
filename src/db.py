@@ -409,6 +409,9 @@ class DatabricksSparkBackend:
         self._flat: pd.DataFrame | None = None  # lazy cache
         self._spark = self._get_spark_session()
         LOGGER.info("Initialized Spark backend for model=%s", self._mv.model_id)
+        current_user = self.current_user()
+        LOGGER.info("Current_user=%s", current_user)
+        
 
     # -- Public interface ----------------------------------------------------
     def execute(self, request: OlapQueryRequest) -> pd.DataFrame:
@@ -520,5 +523,8 @@ def create_databricks_backend(
     LOGGER.info("Creating Databricks backend mode=%s for model=%s", cfg.mode, mv_def.model_id)
     if cfg.mode == "sql":
         return DatabricksSqlBackend(mv_def, cfg)
-    return DatabricksSparkBackend(mv_def, cfg)
+    elif cfg.mode == "spark":
+        return DatabricksSparkBackend(mv_def, cfg)
+    else:
+        raise RuntimeError(f"Unsupported Databricks backend mode: {cfg.mode}")
 

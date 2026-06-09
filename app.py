@@ -1071,8 +1071,10 @@ def get_backend(model_id: str) -> OlapDatabase:
     if model_id not in DB_CACHE:
         LOGGER.info("get_backend -Creating backend for model_id: %s", model_id)
         DB_CACHE[model_id] = create_databricks_backend(get_mv_def(model_id))
+        LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
     else:
         LOGGER.info("get_backend - Backend for model_id %s found in cache", model_id)
+        LOGGER.info("get_backend - DB_CACHE has %s entries", len(DB_CACHE))
     return DB_CACHE[model_id]
 
 
