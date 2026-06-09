@@ -466,7 +466,7 @@ def get_all_model_dropdown_options_from_matrix() -> list[dict[str, str]]:
 
 
 def get_report_dropdown_options(model_id: str, catalog: str | None, schema: str | None) -> list[dict[str, str]]:
-    if not model_id or not catalog or not schema or ACCESS_MATRIX_DF.empty:
+    if not model_id or not catalog or not schema:
         return []
 
     scoped = ACCESS_MATRIX_DF[
@@ -474,7 +474,33 @@ def get_report_dropdown_options(model_id: str, catalog: str | None, schema: str 
         & (ACCESS_MATRIX_DF["schema"] == str(schema))
         & (ACCESS_MATRIX_DF["model_id"] == str(model_id))
     ]
-    return _unique_options(scoped, "report_id")
+    options: list[dict[str, str]] = []
+    seen_report_ids: set[str] = set()
+
+    if not scoped.empty:
+        deduped = (
+            scoped[["report_id", "report_name"]]
+            .dropna(subset=["report_id"])
+            .drop_duplicates(subset=["report_id"], keep="first")
+            .sort_values(by=["report_name", "report_id"])
+        )
+        for _, row in deduped.iterrows():
+            report_id = str(row["report_id"])
+            seen_report_ids.add(report_id)
+            label = str(row["report_name"]).strip() if pd.notna(row["report_name"]) else ""
+            options.append({"label": label or report_id, "value": report_id})
+
+    # Fallback: if matrix is stale or missing report rows, derive options from loaded report YAMLs.
+    for report_id, report in REPORT_DEFS.items():
+        if report_id in seen_report_ids:
+            continue
+        resolved_model = resolve_report_model_id(report, str(catalog), str(schema))
+        if resolved_model != str(model_id):
+            continue
+        options.append({"label": str(report.get("name") or report_id), "value": report_id})
+
+    options.sort(key=lambda o: (str(o.get("label") or "").lower(), str(o.get("value") or "")))
+    return options
 
 
 def _report_request(

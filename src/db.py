@@ -51,6 +51,9 @@ class DatabricksConnectionConfig:
 
 def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
+    # Get token from request header first, then fallback to env var if not present. This allows per-user tokens in a multi-tenant deployment.
+    token = DatabricksSqlBackend._token_from_request_header()
+
     """Load Databricks backend config from environment variables."""
     raw_host = (os.getenv("DATABRICKS_HOST") or "").strip()
     if raw_host.startswith("https://"):
@@ -62,7 +65,7 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
     cfg = DatabricksConnectionConfig(
         server_hostname=raw_host or None,
         http_path=(os.getenv("DATABRICKS_HTTP_PATH") or "").strip() or None,
-        access_token=(os.getenv("DATABRICKS_TOKEN") or "").strip() or None,
+        access_token=token or None,
         default_catalog=(os.getenv("DATABRICKS_DEFAULT_CATALOG") or "").strip() or None,
         default_schema=(os.getenv("DATABRICKS_DEFAULT_SCHEMA") or "").strip() or None,
     )
