@@ -63,7 +63,7 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
         default_schema=os.getenv("DATABRICKS_DEFAULT_SCHEMA"),
     )
     LOGGER.info(
-        "Databricks config loaded: mode=%s, host=%s, access token=%s, catalog=%s, schema=%s",
+        "Databricks config loaded: mode=%s, host=%s, access_token=%s, catalog=%s, schema=%s",
         cfg.mode,
         cfg.server_hostname,
         f"****({len(cfg.access_token)})" if cfg.access_token else None,
