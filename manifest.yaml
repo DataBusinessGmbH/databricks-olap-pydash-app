@@ -1,0 +1,12 @@
+version: 1
+name: "Databricks Olap Pydash App"
+description: "A simple app for OLAP analysis on Metric Views"
+
+resource_specs:
+  - name: "sql-warehouse"
+    description: "The SQL warehouse the app uses to query data."
+    sql_warehouse_spec:
+      permission: "CAN_USE"
+
+user_api_scopes:
+  - "sql"
