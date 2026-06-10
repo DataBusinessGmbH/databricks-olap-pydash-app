@@ -10,13 +10,7 @@ catalog: testdata
 schema: gold
 metric_view: mv_sales
 
-# Default dimensions (optional flat row fields)
-# Use model field names (dimension key or attributes)
-dimensions:
-  - dim_customer
-  - dim_product
-
-# Preferred: fields to show for each dimension
+# Default fields to show for each dimension
 # Keys can be dimension display name (for example "Customer") or table name alias.
 # The dimension key is automatically added when dimension_fields is used.
 dimension_fields:
@@ -37,7 +31,7 @@ keyfigures:
   - MEASURE(`Sales Amount`)
   - MEASURE(`Count`)
 
-# Default filters applied by report
+# FIXED filters applied by report
 filters:
   region:
     not_in: [AMER, LATAM]

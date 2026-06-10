@@ -19,6 +19,7 @@ import importlib
 import functools
 from typing import Any
 from flask import jsonify, request as flask_request
+from databricks import sql
 
 import dash_ag_grid as dag
 import pandas as pd

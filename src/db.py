@@ -21,6 +21,7 @@ import re
 from typing import Callable, Protocol
 from flask import request as flask_request
 import pandas as pd
+from databricks import sql
 
 def _setup_logger() -> logging.Logger:
     level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
@@ -58,11 +59,15 @@ def load_databricks_config_from_env() -> DatabricksConnectionConfig:
 
     """Load Databricks backend config from environment variables."""
     raw_host = (os.getenv("DATABRICKS_HOST") or "").strip()
+    if not raw_host.startswith("https://"):
+        raw_host = f"https://{raw_host}"
+    """
     if raw_host.startswith("https://"):
         raw_host = raw_host[len("https://"):]
     elif raw_host.startswith("http://"):
         raw_host = raw_host[len("http://"):]
     raw_host = raw_host.rstrip("/")
+    """
 
     cfg = DatabricksConnectionConfig(
         server_hostname=raw_host or None,
@@ -189,14 +194,6 @@ class DatabricksSqlBackend:
         return token
 
     def _connect(self):
-        try:
-            sql_mod = importlib.import_module("databricks.sql")
-        except Exception as ex:
-            LOGGER.exception("Failed to import databricks.sql connector")
-            raise RuntimeError(
-                "databricks-sql-connector is not installed. Install it to use SQL backend."
-            ) from ex
-
         LOGGER.debug(
             "Opening Databricks SQL connection to host=%s http_path=%s",
             self._config.server_hostname,
@@ -214,7 +211,14 @@ class DatabricksSqlBackend:
             connect_kwargs["catalog"] = self._config.default_catalog
         if self._config.default_schema:
             connect_kwargs["schema"] = self._config.default_schema
-        return sql_mod.connect(**connect_kwargs)
+        
+        conn =  sql.connect(
+            server_hostname=self._config.server_hostname,
+            http_path=self._config.http_path,
+            access_token=access_token  
+            ) 
+        return conn
+        #return sql_mod.connect(**connect_kwargs)
 
 
 def create_databricks_backend(
