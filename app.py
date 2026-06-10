@@ -719,7 +719,7 @@ def list_schema_names(catalog: str) -> list[str]:
 
     for sql in queries:
         try:
-            df = _run_sql(sql)
+            df = _run_sql(sql, default_catalog=catalog)
         except Exception as e:
             LOGGER.info("Schema listing query failed for %s: %s", catalog, sql)
             LOGGER.info("Schema listing query error", exc_info=e)
@@ -998,7 +998,7 @@ def _fetch_metric_view_yaml(catalog: str, schema: str, metric_view_name: str) ->
 
     for sql in queries:
         try:
-            df = _run_sql(sql)
+            df = _run_sql(sql, default_catalog=catalog)
         except Exception:
             LOGGER.info("Metric view describe query failed for %s: %s", metric_view_name, sql)
             continue
@@ -1163,9 +1163,9 @@ def load_metric_views(catalog: str, schema: str) -> dict[str, MetricViewDef]:
     return result
 
 
-def _run_sql(sql: str) -> pd.DataFrame:
+def _run_sql(sql: str, default_catalog: str | None = None) -> pd.DataFrame:
     LOGGER.info("Running SQL: %s", sql)
-    return get_backend().execute_sql(sql)
+    return get_backend().execute_sql(sql, default_catalog=default_catalog)
 
 
 REPORT_DEFS = load_report_definitions()

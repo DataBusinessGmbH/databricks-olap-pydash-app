@@ -135,11 +135,12 @@ class DatabricksSqlBackend:
         self._validate_config()
         LOGGER.info("Initialized SQL backend")
 
-    def execute_sql(self, sql: str) -> pd.DataFrame:
+    def execute_sql(self, sql: str, default_catalog: str | None = None) -> pd.DataFrame:
         LOGGER.info("Executing SQL query:\n%s", sql)
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute("USE CATALOG {}".format(default_catalog)) if default_catalog else None
             cur.execute(sql)
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
