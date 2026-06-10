@@ -936,7 +936,7 @@ def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
     names: set[str] = set()
     for sql in queries:
         try:
-            df = _run_sql(sql)
+            df = _run_sql(sql, default_catalog=catalog)
         except Exception:
             LOGGER.info("Metric view discovery query failed: %s", sql)
             continue
