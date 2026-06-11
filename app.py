@@ -26,7 +26,7 @@ import pandas as pd
 from dash import Dash, Input, Output, State, dcc, html, no_update
 import dash
 
-from src.model import MetricViewDef, MvField
+from src.model import MetricViewDef, MvField, metric_view_def_to_dict, metric_view_def_from_dict
 from src.db import (
     LOGGER,
     OlapDatabase,
@@ -47,9 +47,6 @@ BASE_DIR = Path(__file__).resolve().parent
 REPORTS_DIR = BASE_DIR / "reports"
 DEFAULT_MAX_ROWS = 1000
 STARTUP_WARNINGS: list[str] = []
-# In-memory model registry: model_id → MetricViewDef
-METRIC_VIEW_REGISTRY: dict[str, MetricViewDef] = {}
-LOGGED_IN_USER = None
 
 
 def ensure_logging_visible() -> None:
@@ -140,18 +137,22 @@ def metric_view_model_id(catalog: str, schema: str, metric_view_name: str) -> st
     return f"metricview_{safe_catalog}_{safe_schema}_{safe_stem}"
 
 
-def register_metric_views(catalog: str, schema: str) -> dict[str, str]:
-    """Discover, parse, and register all metric views for catalog/schema into METRIC_VIEW_REGISTRY."""
+def register_metric_views(
+    catalog: str,
+    schema: str,
+    registry: dict[str, MetricViewDef],
+) -> dict[str, str]:
+    """Discover, parse, and register all metric views for catalog/schema into a local registry."""
     model_ids: dict[str, str] = {}  # model_id → metric_view_name
 
     mv_defs = load_metric_views(catalog, schema)
     for mv_name, mv_def in mv_defs.items():
         model_id = mv_def.model_id
 
-        if model_id in model_ids or model_id in METRIC_VIEW_REGISTRY:
+        if model_id in model_ids or model_id in registry:
             suffix = 1
             unique_id = f"{model_id}_{suffix}"
-            while unique_id in model_ids or unique_id in METRIC_VIEW_REGISTRY:
+            while unique_id in model_ids or unique_id in registry:
                 suffix += 1
                 unique_id = f"{model_id}_{suffix}"
             STARTUP_WARNINGS.append(
@@ -167,7 +168,7 @@ def register_metric_views(catalog: str, schema: str) -> dict[str, str]:
                 fields=mv_def.fields,
             )
 
-        METRIC_VIEW_REGISTRY[model_id] = mv_def
+        registry[model_id] = mv_def
         model_ids[model_id] = mv_name
 
     if not model_ids:
@@ -356,12 +357,13 @@ def resolve_report_model_id(report: dict[str, Any], catalog: str, schema: str) -
     return metric_view_model_id(catalog, report_schema, metric_view)
 
 
-def _build_access_matrix() -> pd.DataFrame:
+def _build_access_matrix() -> tuple[pd.DataFrame, dict[str, MetricViewDef]]:
     rows: list[dict[str, str]] = []
+    registry: dict[str, MetricViewDef] = {}
 
     for catalog in list_catalog_names():
         for schema in list_schema_names(catalog):
-            model_map = register_metric_views(catalog, schema)
+            model_map = register_metric_views(catalog, schema, registry)
             for model_id, metric_view_name in model_map.items():
                 rows.append(
                     {
@@ -389,7 +391,7 @@ def _build_access_matrix() -> pd.DataFrame:
                         )
 
     access_df = pd.DataFrame(rows, columns=["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"])
-    return access_df
+    return access_df, registry
 
 
 def _unique_options(df: pd.DataFrame, value_col: str) -> list[dict[str, str]]:
@@ -404,31 +406,35 @@ def _unique_options(df: pd.DataFrame, value_col: str) -> list[dict[str, str]]:
     return [{"label": str(row[value_col]), "value": str(row[value_col])} for _, row in deduped.iterrows()]
 
 
-def get_catalog_dropdown_options_from_matrix() -> list[dict[str, str]]:
-    if ACCESS_MATRIX_DF.empty:
+def get_catalog_dropdown_options_from_matrix(access_matrix_df: pd.DataFrame) -> list[dict[str, str]]:
+    if access_matrix_df.empty:
         return []
-    return _unique_options(ACCESS_MATRIX_DF, "catalog")
+    return _unique_options(access_matrix_df, "catalog")
 
 
-def get_schema_dropdown_options_from_matrix(catalog: str | None) -> list[dict[str, str]]:
-    if not catalog or ACCESS_MATRIX_DF.empty:
+def get_schema_dropdown_options_from_matrix(access_matrix_df: pd.DataFrame, catalog: str | None) -> list[dict[str, str]]:
+    if not catalog or access_matrix_df.empty:
         return []
-    scoped = ACCESS_MATRIX_DF[ACCESS_MATRIX_DF["catalog"] == str(catalog)]
+    scoped = access_matrix_df[access_matrix_df["catalog"] == str(catalog)]
     return _unique_options(scoped, "schema")
 
 
-def get_all_schema_dropdown_options_from_matrix() -> list[dict[str, str]]:
-    if ACCESS_MATRIX_DF.empty:
+def get_all_schema_dropdown_options_from_matrix(access_matrix_df: pd.DataFrame) -> list[dict[str, str]]:
+    if access_matrix_df.empty:
         return []
-    return _unique_options(ACCESS_MATRIX_DF, "schema")
+    return _unique_options(access_matrix_df, "schema")
 
 
-def get_model_dropdown_options_from_matrix(catalog: str | None, schema: str | None) -> list[dict[str, str]]:
-    if not catalog or not schema or ACCESS_MATRIX_DF.empty:
+def get_model_dropdown_options_from_matrix(
+    access_matrix_df: pd.DataFrame,
+    catalog: str | None,
+    schema: str | None,
+) -> list[dict[str, str]]:
+    if not catalog or not schema or access_matrix_df.empty:
         return []
-    scoped = ACCESS_MATRIX_DF[
-        (ACCESS_MATRIX_DF["catalog"] == str(catalog))
-        & (ACCESS_MATRIX_DF["schema"] == str(schema))
+    scoped = access_matrix_df[
+        (access_matrix_df["catalog"] == str(catalog))
+        & (access_matrix_df["schema"] == str(schema))
     ]
     if scoped.empty:
         return []
@@ -448,11 +454,11 @@ def get_model_dropdown_options_from_matrix(catalog: str | None, schema: str | No
     ]
 
 
-def get_all_model_dropdown_options_from_matrix() -> list[dict[str, str]]:
-    if ACCESS_MATRIX_DF.empty:
+def get_all_model_dropdown_options_from_matrix(access_matrix_df: pd.DataFrame) -> list[dict[str, str]]:
+    if access_matrix_df.empty:
         return []
     deduped = (
-        ACCESS_MATRIX_DF[["model_id", "metric_view"]]
+        access_matrix_df[["model_id", "metric_view"]]
         .dropna(subset=["model_id"])
         .drop_duplicates(subset=["model_id"], keep="first")
         .sort_values(by=["metric_view", "model_id"])
@@ -466,14 +472,19 @@ def get_all_model_dropdown_options_from_matrix() -> list[dict[str, str]]:
     ]
 
 
-def get_report_dropdown_options(model_id: str, catalog: str | None, schema: str | None) -> list[dict[str, str]]:
+def get_report_dropdown_options(
+    access_matrix_df: pd.DataFrame,
+    model_id: str,
+    catalog: str | None,
+    schema: str | None,
+) -> list[dict[str, str]]:
     if not model_id or not catalog or not schema:
         return []
 
-    scoped = ACCESS_MATRIX_DF[
-        (ACCESS_MATRIX_DF["catalog"] == str(catalog))
-        & (ACCESS_MATRIX_DF["schema"] == str(schema))
-        & (ACCESS_MATRIX_DF["model_id"] == str(model_id))
+    scoped = access_matrix_df[
+        (access_matrix_df["catalog"] == str(catalog))
+        & (access_matrix_df["schema"] == str(schema))
+        & (access_matrix_df["model_id"] == str(model_id))
     ]
     options: list[dict[str, str]] = []
     seen_report_ids: set[str] = set()
@@ -1170,12 +1181,6 @@ def _run_sql(sql: str, default_catalog: str | None = None) -> pd.DataFrame:
 
 REPORT_DEFS = load_report_definitions()
 
-ACCESS_MATRIX_DF = pd.DataFrame(
-    columns=["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"]
-)
-logging.info("Startup: ACCESS_MATRIX_DF initialized empty; matrix will be built in user request context")
-
-
 BACKEND_EXECUTOR: OlapDatabase | None = None
 
 CATALOG_OPTIONS = [
@@ -1189,14 +1194,15 @@ INITIAL_MODEL_VALUE = None
 INITIAL_MODEL_OPTIONS: list[dict[str, str]] = []
 
 
-def model_exists(model_id: str | None) -> bool:
-    if not model_id:
-        return False
-    return str(model_id) in METRIC_VIEW_REGISTRY
+def _resolve_mv_def_by_model_id(model_id: str) -> MetricViewDef:
+    """
+    Resolve a metric-view definition by model_id without relying on global state.
 
-
-def get_mv_def(model_id: str) -> MetricViewDef:
-    mv_def = METRIC_VIEW_REGISTRY.get(model_id)
+    This is primarily used by the Flask /api/filter-values route, which runs
+    outside Dash callback state and therefore cannot directly access dcc.Store.
+    """
+    _access_df, registry = _build_access_matrix()
+    mv_def = registry.get(str(model_id))
     if mv_def is None:
         raise KeyError(f"Unknown model id: {model_id}")
     return mv_def
@@ -1208,13 +1214,45 @@ def get_backend() -> OlapDatabase:
         BACKEND_EXECUTOR = create_databricks_backend()
     return BACKEND_EXECUTOR
 
+
+# ---------------------------------------------------------------------------
+# Store serialization / deserialization helpers
+# ---------------------------------------------------------------------------
+
+def _get_access_matrix_from_store(store_data) -> pd.DataFrame:
+    """Reconstruct access-matrix DataFrame from dcc.Store list-of-dicts payload."""
+    cols = ["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"]
+    if isinstance(store_data, list) and store_data:
+        return pd.DataFrame(store_data, columns=cols)
+    return pd.DataFrame(columns=cols)
+
+
+def _get_mv_def_from_store(store_data, model_id: str) -> MetricViewDef | None:
+    """Deserialize a single MetricViewDef from the metric-view-defs-store dict."""
+    if not isinstance(store_data, dict) or not model_id:
+        return None
+    raw = store_data.get(str(model_id))
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return metric_view_def_from_dict(raw)
+    except Exception:
+        LOGGER.warning("Failed to deserialize MetricViewDef for %s from store", model_id, exc_info=True)
+        return None
+
+
+def _model_exists_in_store(store_data, model_id: str | None) -> bool:
+    """Check whether a model_id is present in the metric-view-defs-store."""
+    return bool(model_id and isinstance(store_data, dict) and str(model_id) in store_data)
+
+
 def execute_olap_request(model_id: str, request: OlapQueryRequest) -> pd.DataFrame:
-    mv_def = get_mv_def(model_id)
+    mv_def = _resolve_mv_def_by_model_id(model_id)
     return planner_execute_olap_request(get_backend(), mv_def, request)
 
 
 def fetch_filter_values(model_id: str, field_name: str, max_values: int = 500) -> list:
-    mv_def = get_mv_def(model_id)
+    mv_def = _resolve_mv_def_by_model_id(model_id)
     return planner_fetch_filter_values(get_backend(), mv_def, field_name, max_values=max_values)
 
 
@@ -1236,7 +1274,7 @@ def build_default_request(mv_def: MetricViewDef, max_rows: int | None = None) ->
 
 
 def get_default_view_table(model_id: str, max_rows: int | None = None) -> pd.DataFrame:
-    mv_def = get_mv_def(model_id)
+    mv_def = _resolve_mv_def_by_model_id(model_id)
     request = build_default_request(mv_def, max_rows=max_rows or DEFAULT_MAX_ROWS)
     return execute_olap_request(model_id, request)
 
@@ -1351,17 +1389,15 @@ def get_dimension_filter_fields(mv_def: MetricViewDef) -> list[str]:
     return sorted(f.name for f in mv_def.dimension_fields)
 
 
-def get_dimension_dropdown_options(model_id: str) -> list[dict[str, str]]:
-    if not model_exists(model_id):
+def get_dimension_dropdown_options(mv_def: MetricViewDef | None) -> list[dict[str, str]]:
+    if mv_def is None:
         return []
-    mv_def = get_mv_def(model_id)
     return [{"label": g, "value": g} for g in mv_def.groups]
 
 
-def get_field_filter_dropdown_options(model_id: str, dimension_name: str | None) -> list[dict[str, str]]:
-    if not model_exists(model_id) or not dimension_name:
+def get_field_filter_dropdown_options(mv_def: MetricViewDef | None, dimension_name: str | None) -> list[dict[str, str]]:
+    if mv_def is None or not dimension_name:
         return []
-    mv_def = get_mv_def(model_id)
     return [
         {"label": f.label, "value": f.name}
         for f in mv_def.fields_for_group(dimension_name)
@@ -1448,6 +1484,16 @@ def startup_warning_style(hidden: bool) -> dict[str, str]:
         "marginBottom": "12px",
         "fontSize": "13px",
     }
+
+
+def loading_indicator_card(text: str = "Updating..."):
+    return html.Div(
+        className="app-loading-card",
+        children=[
+            html.Div(className="app-loading-spinner"),
+            html.Div(text, className="app-loading-text"),
+        ],
+    )
 
 # ---------------------------------------------------------------------------
 # Grid column-definition builders  (driven by MetricViewDef)
@@ -1616,11 +1662,19 @@ app.layout = html.Div(
         "margin": "0 auto",
     },
     children=[
+        # Page-load trigger for single initialization callback
+        dcc.Location(id="url", refresh=False),
+        # Per-session stores (populated by initialize_session on every page load)
+        dcc.Store(id="user-store",              storage_type="session", data={}),
+        dcc.Store(id="access-matrix-store",     storage_type="session", data=[]),
+        dcc.Store(id="metric-view-defs-store",  storage_type="session", data={}),
+        dcc.Store(id="logged-in-user-store",    storage_type="session", data={"user": ""} ),
+        dcc.Store(id="session-init-status-store", storage_type="session", data={"ready": False}),
         # Hidden store to track filter model changes
         dcc.Store(id="filter-change-trigger", data={"timestamp": 0, "filterModel": {}}),
         dcc.Store(id="column-change-trigger", data={"timestamp": 0, "columnState": []}),
-        dcc.Store(id="manual-filter-store", data={"timestamp": 0, "filters": {}}),
-        dcc.Store(id="active-report-store", data={"id": "", "timestamp": pd.Timestamp.utcnow().isoformat()}),
+        dcc.Store(id="manual-filter-store",   data={"timestamp": 0, "filters": {}}),
+        dcc.Store(id="active-report-store",   data={"id": "", "timestamp": pd.Timestamp.utcnow().isoformat()}),        
         dcc.Store(id="field-filter-values-target", data={"mode": "include"}),
         dcc.Store(id="field-filter-modal-context", data={}),
         dcc.Input(id="field-filter-active-model", value="", style={"display": "none"}),
@@ -1650,6 +1704,19 @@ app.layout = html.Div(
                 ),
             ],
             style=startup_warning_style(hidden=not STARTUP_WARNINGS),
+        ),
+        html.Div(
+            id="session-loading-overlay",
+            style={
+                "position": "fixed",
+                "inset": "0",
+                "zIndex": 5000,
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "background": "rgba(255, 255, 255, 0.88)",
+            },
+            children=[loading_indicator_card("Updating...")],
         ),
         html.Div(
             style={
@@ -2189,30 +2256,35 @@ app.layout = html.Div(
                 "background": "#fff",
             },
             children=[
-                dag.AgGrid(
-                    id="olap-grid",
-                    rowData=initial_df.to_dict("records"),
-                    columnDefs=[],
-                    eventListeners={
-                        "filterChanged": ["onGridFilterChanged(params)"],
-                        "columnVisible": ["onGridColumnStateChanged(params)"],
-                        "columnPinned": ["onGridColumnStateChanged(params)"],
-                        "columnMoved": ["onGridColumnStateChanged(params)"],
-                        "columnRowGroupChanged": ["onGridColumnStateChanged(params)"],
-                        "columnPivotChanged": ["onGridColumnStateChanged(params)"],
-                        "columnValueChanged": ["onGridColumnStateChanged(params)"],
-                    },                    
-                    dangerously_allow_code=True,
-                    defaultColDef={
-                        "flex": 1,
-                        "minWidth": 120,
-                        "filter": False,      # off by default; dimension cols override per-column
-                        "floatingFilter": False,
-                    },
-                    enableEnterpriseModules=True,
-                    className="ag-theme-alpine",
-                    dashGridOptions=build_grid_options(),
-                    style={"height": "78vh", "width": "100%"},
+                dcc.Loading(
+                    id="grid-loading-overlay",
+                    fullscreen=True,
+                    custom_spinner=loading_indicator_card("Updating..."),
+                    children=dag.AgGrid(
+                        id="olap-grid",
+                        rowData=initial_df.to_dict("records"),
+                        columnDefs=[],
+                        eventListeners={
+                            "filterChanged": ["onGridFilterChanged(params)"],
+                            "columnVisible": ["onGridColumnStateChanged(params)"],
+                            "columnPinned": ["onGridColumnStateChanged(params)"],
+                            "columnMoved": ["onGridColumnStateChanged(params)"],
+                            "columnRowGroupChanged": ["onGridColumnStateChanged(params)"],
+                            "columnPivotChanged": ["onGridColumnStateChanged(params)"],
+                            "columnValueChanged": ["onGridColumnStateChanged(params)"],
+                        },
+                        dangerously_allow_code=True,
+                        defaultColDef={
+                            "flex": 1,
+                            "minWidth": 120,
+                            "filter": False,      # off by default; dimension cols override per-column
+                            "floatingFilter": False,
+                        },
+                        enableEnterpriseModules=True,
+                        className="ag-theme-alpine",
+                        dashGridOptions=build_grid_options(),
+                        style={"height": "78vh", "width": "100%"},
+                    ),
                 )
             ],
         ),
@@ -2220,42 +2292,102 @@ app.layout = html.Div(
 )
 
 
+
 @app.callback(
+    Output("user-store", "data"),
+    Output("access-matrix-store", "data"),
+    Output("metric-view-defs-store", "data"),
+    Output("logged-in-user-store", "data"),
+    Output("session-init-status-store", "data"),
+    Output("logged-in-user", "children"),
     Output("catalog-selector", "options"),
     Output("catalog-selector", "value"),
-    Input("dismiss-startup-warning-btn", "n_clicks"),
-    State("catalog-selector", "value"),
+    Input("url", "href"),
+    prevent_initial_call=False,
 )
-def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
-    """Initialize catalog dropdown without triggering SQL before grid callback."""
-    global ACCESS_MATRIX_DF
-    global BACKEND_EXECUTOR
-    ACCESS_MATRIX_DF = ACCESS_MATRIX_DF.iloc[0:0].copy()  # Keep columns, clear only rows.
-    BACKEND_EXECUTOR = None  # Reset executor to ensure it is re-initialized with correct user context.
-    
-    LOGGER.info("initialize_catalog_options called")
-    ctx = dash.callback_context
-    triggered = {t["prop_id"] for t in ctx.triggered}
-    LOGGER.info(f"Grid state change triggered by: {triggered}")
-    
-    LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
-    LOGGER.info("Logged in user: %s", LOGGED_IN_USER)    
+def initialize_session(href):
+    """
+    Single initialization callback — fires once on every browser page load.
 
-    # Build access matrix lazily in request context so dependent dropdowns can populate.
-    if ACCESS_MATRIX_DF.empty:
-        try:
-            LOGGER.info("Initializing ACCESS_MATRIX_DF in initialize_catalog_options request context")
-            METRIC_VIEW_REGISTRY.clear()
-            ACCESS_MATRIX_DF = _build_access_matrix()
-            LOGGER.info("ACCESS_MATRIX_DF initialized with %s entries", len(ACCESS_MATRIX_DF))
-        except Exception:
-            LOGGER.warning("Failed to initialize ACCESS_MATRIX_DF during catalog init", exc_info=True)
+    Loads all session state:
+      - logged-in user (via SELECT current_user() using the request-time token)
+      - access matrix (catalog/schema/model/report structure the user can see)
+      - metric view definitions (field metadata for all accessible metric views)
 
-    options = get_catalog_dropdown_options_from_matrix()
-    if not options:
-        options = CATALOG_OPTIONS
-    values = {o["value"] for o in options}
-    return options, None
+    All results are stored in dcc.Store (session-scoped, per browser tab).
+    The token is NEVER stored — it is re-read from the request header or env
+    var on every SQL execution inside db.py.
+    """
+
+    LOGGER.info("initialize_session: browser page load, reinitializing session state")
+
+    # Reset process globals so this request's token is used for every SQL call.
+    global BACKEND_EXECUTOR   
+    BACKEND_EXECUTOR = None
+
+    # --- Logged-in user ---------------------------------------------------
+    try:
+        logged_in_user = get_logged_in_user()
+    except Exception:
+        LOGGER.warning("initialize_session: failed to resolve current user", exc_info=True)
+        logged_in_user = "unknown"
+    LOGGER.info("initialize_session: logged_in_user=%s", logged_in_user)
+
+    user_data = {"user": logged_in_user}
+
+    # --- Access matrix (catalog/schema/metric-view/report rows) -----------
+    access_matrix_df = pd.DataFrame(
+        columns=["catalog", "schema", "model_id", "metric_view", "report_id", "report_name"]
+    )
+    metric_registry: dict[str, MetricViewDef] = {}
+    try:
+        access_matrix_df, metric_registry = _build_access_matrix()
+        LOGGER.info("initialize_session: access matrix built with %s rows", len(access_matrix_df))
+    except Exception:
+        LOGGER.warning("initialize_session: failed to build access matrix", exc_info=True)
+
+    access_matrix_data = access_matrix_df.to_dict("records")
+
+    # --- Metric view definitions (serialized for per-session store) -------
+    metric_view_defs_data: dict[str, dict] = {
+        model_id: metric_view_def_to_dict(mvd)
+        for model_id, mvd in metric_registry.items()
+    }
+    LOGGER.info("initialize_session: serialized %s metric view defs", len(metric_view_defs_data))
+
+    # --- Catalog dropdown -------------------------------------------------
+    catalog_options = get_catalog_dropdown_options_from_matrix(access_matrix_df)
+    if not catalog_options:
+        catalog_options = CATALOG_OPTIONS
+
+    init_status = {"ready": True, "timestamp": pd.Timestamp.utcnow().isoformat()}
+    return user_data, access_matrix_data, metric_view_defs_data, user_data, init_status, logged_in_user, catalog_options, None
+
+
+@app.callback(
+    Output("session-loading-overlay", "style"),
+    Input("session-init-status-store", "data"),
+    prevent_initial_call=False,
+)
+def toggle_session_loading_overlay(init_status):
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "zIndex": 5000,
+        "alignItems": "center",
+        "justifyContent": "center",
+        "background": "rgba(255, 255, 255, 0.88)",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    init_ready = isinstance(init_status, dict) and bool(init_status.get("ready"))
+    if init_ready:
+        return hidden
+    return shown
 
 
 @app.callback(
@@ -2263,12 +2395,12 @@ def initialize_catalog_options(_dismiss_clicks, current_catalog: str | None):
     Output("schema-selector", "value"),
     Input("catalog-selector", "value"),
     State("schema-selector", "value"),
+    State("access-matrix-store", "data"),
     prevent_initial_call=True,
 )
-def on_catalog_change(catalog: str | None, current_schema: str | None):
-    schema_options = get_schema_dropdown_options_from_matrix(catalog)
-    values = {o["value"] for o in schema_options}
-    #next_schema = current_schema if current_schema in values else (schema_options[0]["value"] if schema_options else None)
+def on_catalog_change(catalog: str | None, current_schema: str | None, access_matrix_data):
+    df = _get_access_matrix_from_store(access_matrix_data)
+    schema_options = get_schema_dropdown_options_from_matrix(df, catalog)
     return schema_options, None
 
 
@@ -2281,21 +2413,22 @@ def on_catalog_change(catalog: str | None, current_schema: str | None):
     Input("catalog-selector", "value"),
     Input("schema-selector", "value"),
     State("model-selector", "value"),
+    State("access-matrix-store", "data"),
     prevent_initial_call=True,
 )
 def on_namespace_change_update_models(
     catalog: str | None,
     schema: str | None,
     current_model_id: str | None,
+    access_matrix_data,
 ):
     empty_state = {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}}
 
     if not catalog or not schema:
         return [], None, "{}", empty_state, "Select a catalog and schema."
 
-    options = get_model_dropdown_options_from_matrix(catalog, schema)
-    values = {o["value"] for o in options}
-    #next_model = current_model_id if current_model_id in values else (options[0]["value"] if options else None)
+    df = _get_access_matrix_from_store(access_matrix_data)
+    options = get_model_dropdown_options_from_matrix(df, catalog, schema)
     return options, None, "{}", empty_state, ""
 
 
@@ -2307,6 +2440,7 @@ def on_namespace_change_update_models(
     Input("schema-selector", "value"),
     Input("model-selector", "value"),
     State("report-selector", "value"),
+    State("access-matrix-store", "data"),
     prevent_initial_call=True,
 )
 def on_model_or_namespace_or_report_change(
@@ -2314,8 +2448,12 @@ def on_model_or_namespace_or_report_change(
     schema: str | None,
     model_id: str | None,
     selected_report_id: str | None,
+    access_matrix_data,
+    prevent_initial_call=True,
 ):
-    options = get_report_dropdown_options(model_id or "", catalog, schema)
+    df = _get_access_matrix_from_store(access_matrix_data)
+    options = get_report_dropdown_options(df, model_id or "", catalog, schema)
+
     values = {o["value"] for o in options}
     next_report_id = selected_report_id if selected_report_id in values else None
     active_report = {
@@ -2426,17 +2564,21 @@ def on_clear_filters_sync_input(clear_clicks):
     Input("model-selector", "value"),
     Input("field-filter-dimension-selector", "value"),
     State("field-filter-selector", "value"),
+    State("metric-view-defs-store", "data"),
+    prevent_initial_call=True,
 )
 def on_model_or_dimension_change_update_field_filter_options(
     model_id: str,
     current_dimension: str | None,
     current_field: str | None,
+    metric_view_defs_data,
 ):
-    dim_options = get_dimension_dropdown_options(model_id)
+    mv_def = _get_mv_def_from_store(metric_view_defs_data, model_id)
+    dim_options = get_dimension_dropdown_options(mv_def)
     dim_values = {o["value"] for o in dim_options}
     next_dimension = current_dimension if current_dimension in dim_values else (dim_options[0]["value"] if dim_options else None)
 
-    field_options = get_field_filter_dropdown_options(model_id, next_dimension)
+    field_options = get_field_filter_dropdown_options(mv_def, next_dimension)
     field_values = {o["value"] for o in field_options}
     next_field = current_field if current_field in field_values else (field_options[0]["value"] if field_options else None)
     return model_id, next_field or "", dim_options, next_dimension, field_options, next_field
@@ -2650,6 +2792,7 @@ def on_field_filter_apply_or_clear(
     State("field-filter-modal-context", "data"),
     State("field-filter-modal-include-input", "value"),
     State("field-filter-modal-exclude-input", "value"),
+    State("metric-view-defs-store", "data"),
     prevent_initial_call=True,
 )
 def on_field_filter_values_modal_toggle(
@@ -2659,6 +2802,7 @@ def on_field_filter_values_modal_toggle(
     modal_context,
     include_csv,
     exclude_csv,
+    metric_view_defs_data,
 ):
     ctx = dash.callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
@@ -2701,7 +2845,8 @@ def on_field_filter_values_modal_toggle(
     else:
         title = "Valid Values"
 
-    if not model_exists(model_id) or not field_name:
+    model_known = _model_exists_in_store(metric_view_defs_data, model_id)
+    if not model_known or not field_name:
         return shown, [], [], {"mode": target_mode}, "No values available.", title
 
     try:
@@ -2794,9 +2939,10 @@ def on_dismiss_startup_warning(n_clicks):
     Input("clear-filters-btn", "n_clicks"),
     Input("server-filter-input", "value"),
     State("model-selector", "value"),
+    State("metric-view-defs-store", "data"),
     prevent_initial_call=True,
 )
-def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
+def on_manual_filter_change(clear_clicks, filter_text, model_id: str, metric_view_defs_data):
     ctx = dash.callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
 
@@ -2808,7 +2954,8 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
             filter_button_label(0),
         )
 
-    if not model_exists(model_id):
+    mv_def = _get_mv_def_from_store(metric_view_defs_data, model_id)
+    if mv_def is None:
         return (
             {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}},
             "",
@@ -2816,7 +2963,7 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
             filter_button_label(0),
         )
 
-    parsed, error = parse_manual_filters(filter_text, get_mv_def(model_id))
+    parsed, error = parse_manual_filters(filter_text, mv_def)
     if error:
         return (
             no_update,
@@ -2836,7 +2983,6 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
 @app.callback(
     Output("olap-grid", "rowData"),
     Output("olap-grid", "columnDefs"),
-    Output("logged-in-user", "children"),
     Input("catalog-selector", "value"),
     Input("schema-selector", "value"),
     Input("model-selector", "value"),
@@ -2847,57 +2993,36 @@ def on_manual_filter_change(clear_clicks, filter_text, model_id: str):
     Input("column-change-trigger", "data"),
     Input("filter-change-trigger", "data"),
     Input("manual-filter-store", "data"),
+    State("metric-view-defs-store", "data"),
 )
-def on_grid_state_change(catalog_value, 
-                         schema_value, 
-                         model_id: str, 
-                         report_id, 
-                         max_rows_value, 
-                         active_report_data, 
-                         column_state, 
-                         column_trigger, 
-                         filter_trigger, 
-                         manual_filter_data):
+def on_grid_state_change(catalog_value,
+                         schema_value,
+                         model_id: str,
+                         report_id,
+                         max_rows_value,
+                         active_report_data,
+                         column_state,
+                         column_trigger,
+                         filter_trigger,
+                         manual_filter_data,
+                         metric_view_defs_data):
     """
     Single unified callback — fires on every grid state change:
       - model selector, max rows, column grouping/pivot, filter selections.
 
     Rebuilds column defs only when the model changes; always re-queries backend.
     All filtering and grouping is resolved server-side — AG Grid never filters locally.
+    Session user and access matrix are managed by initialize_session; this callback
+    reads metric view definitions from the per-session metric-view-defs-store.
     """
     ctx = dash.callback_context
     triggered = {t["prop_id"] for t in ctx.triggered}
     LOGGER.info(f"Grid state change triggered by: {triggered}")
 
-    global ACCESS_MATRIX_DF
-    global LOGGED_IN_USER
-
-    " On initial page load, there may be multiple triggers as dropdowns populate and default values are set. "
-    " We want to ignore these initial triggers and avoid hitting the backend until the user has made an explicit selection. "
-    " We use the presence of the columnState trigger as a heuristic for whether this is an initial load (since columnState is always emitted on grid initialization) vs a user interaction."
-
-    initial_triggers = {
-        ".",
-        "report-selector.value",
-    }    
-    
-    if triggered.issubset(initial_triggers):        
-        LOGGER.info("Initial callback trigger detected.")
-        LOGGED_IN_USER = get_logged_in_user()  # Populate cache for later callbacks.
-        LOGGER.info("Logged in user: %s", LOGGED_IN_USER)
-
-        if ACCESS_MATRIX_DF.empty:
-            LOGGER.info("Initializing ACCESS_MATRIX_DF in on_grid_state_change request context")
-            METRIC_VIEW_REGISTRY.clear()
-            ACCESS_MATRIX_DF = _build_access_matrix()
-            LOGGER.info("ACCESS_MATRIX_DF initialized with %s entries", len(ACCESS_MATRIX_DF))
-
-    # If critical context is missing, return empty data and avoid triggering any downstream effects (e.g. filter value fetches) by returning early.
+    # If critical context is missing, return early to avoid hitting the backend.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
-        return [], [], LOGGED_IN_USER
-
-    logged_in_user = get_logged_in_user()
+        return [], []
 
     print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
     print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
@@ -2911,8 +3036,6 @@ def on_grid_state_change(catalog_value,
             print(f"[on_grid_state_change] using columnState from Store: {effective_column_state}", flush=True)
 
     filter_model = {}
-
-    # Try Store first
     if isinstance(filter_trigger, dict):
         candidate = filter_trigger.get("filterModel")
         if isinstance(candidate, dict):
@@ -2925,13 +3048,17 @@ def on_grid_state_change(catalog_value,
         if isinstance(candidate, dict):
             manual_filters = candidate
 
-    if not catalog_value or not schema_value or not model_exists(model_id):
-        return [], [], LOGGED_IN_USER
+    if not catalog_value or not schema_value or not _model_exists_in_store(metric_view_defs_data, model_id):
+        return [], []
 
     if report_id in (None, ""):
-        return [], [], LOGGED_IN_USER
+        return [], []
 
-    selected_model = get_mv_def(model_id)
+    selected_model = _get_mv_def_from_store(metric_view_defs_data, model_id)
+    if selected_model is None:
+        LOGGER.warning("on_grid_state_change: MetricViewDef not found in store for model_id=%s", model_id)
+        return [], []
+
     max_rows = sanitize_max_rows(max_rows_value)
     rebuild_cols = (
         "model-selector.value" in triggered
@@ -2952,22 +3079,11 @@ def on_grid_state_change(catalog_value,
     runtime_filters.update(manual_filters)
 
     if report_def is not None:
-        # Honor report defaults unless the callback was explicitly triggered by
-        # column-state interactions (group/pivot/visibility changes).
         use_grid_state_for_report = (
             "column-change-trigger.data" in triggered
             or "olap-grid.columnState" in triggered
         )
         report_column_state = effective_column_state if use_grid_state_for_report else None
-        """
-        if report_column_state is None:
-            # Initial presentation: derive column state from report defaults.
-            report_column_state = _build_report_default_column_state(
-                selected_model,
-                report_def,
-                max_rows,
-            )
-        """
 
         request = _report_request(
             selected_model,
@@ -2997,15 +3113,9 @@ def on_grid_state_change(catalog_value,
         filter_model,
     )
 
-    result_df = execute_olap_request(model_id, request)
+    result_df = planner_execute_olap_request(get_backend(), selected_model, request)
 
-    # Rebuild column defs only when model/report changes.
-    # Rebuilding defs on columnState events can cause AG Grid to emit a second
-    # columnState change while it reapplies column metadata.
     if rebuild_cols:
-        # When a report is active, visible_fields should come from report YAML
-        # semantics (request rows + keyfigures), not from backend result shape.
-        # This keeps the default view aligned with report defaults.
         report_visible: set[str] | None = None
         if report_def is not None:
             requested_fields = set(request.rows or []).union(set(request.metrics or []))
@@ -3015,7 +3125,9 @@ def on_grid_state_change(catalog_value,
     else:
         new_col_defs = dash.no_update
 
-    return result_df.to_dict("records"), new_col_defs, logged_in_user
+    return result_df.to_dict("records"), new_col_defs
+
+
 
 
 if __name__ == "__main__":
