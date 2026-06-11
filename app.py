@@ -641,7 +641,7 @@ def _report_request(
         return rows, metrics
 
     if column_state:
-        request = build_request_from_grid_state(column_state, max_rows)
+        request = build_request_from_grid_state(column_state, max_rows, mv_def=mv_def)
         rows = list(request.rows or [])
         metrics = list(request.metrics or [])
         default_rows, default_metrics = _defaults_from_report()
@@ -1050,6 +1050,25 @@ def _parse_metric_view_yaml(
     dimensions = raw.get("dimensions", []) or []
     measures_raw = raw.get("measures", []) or []
 
+    # Track fields consumed by measures so they are not also exposed as dimensions.
+    measure_used_names: set[str] = set()
+    measure_used_refs: set[tuple[str, str]] = set()
+    for measure in measures_raw:
+        if not isinstance(measure, dict):
+            continue
+        m_name = str(measure.get("name") or "").strip()
+        if m_name:
+            measure_used_names.add(m_name)
+
+        m_expr = str(measure.get("expr") or "").strip()
+        if not m_expr:
+            continue
+
+        # Capture direct alias.column references in expressions like
+        # SUM(source.sales), source.sales, dim_customer.customer_id, etc.
+        for alias, col in re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?", m_expr):
+            measure_used_refs.add((alias, col))
+
     # Build join map: alias → {dim_name, dim_key}
     join_info: dict[str, dict[str, str]] = {}
     for join in joins:
@@ -1072,6 +1091,9 @@ def _parse_metric_view_yaml(
                 "dim_name": alias.replace("_", " ").title(),
                 "dim_key": dim_side[1],
             }
+            LOGGER.debug(f"Parsed join: alias={alias} dim_key={dim_side[1]} dim_name={alias.replace('_', ' ').title()}")
+    
+    LOGGER.debug(f"Join info for {metric_view_name}: {join_info}")
 
     fields: list[MvField] = []
     seen: set[str] = set()
@@ -1087,17 +1109,51 @@ def _parse_metric_view_yaml(
             continue
         alias, col = ref
         if alias == "source":
-            continue  # fact-level; not a dimension field on the metric view
-        if alias not in join_info:
-            continue
-        ji = join_info[alias]
-        field_type = "dimension_key" if col == ji["dim_key"] else "dimension_attr"
+            field_type = "dimension_attr"
+            group_name = "Other Dimensions"
+        elif alias not in join_info:
+            # If alias is not in join_info, try to find a join by matching alias name
+            matched_join_info = None
+            matched_join_alias = None
+            for join_alias, ji in join_info.items():
+                # Try exact match or case-insensitive match
+                if alias.lower() == join_alias.lower():
+                    matched_join_info = ji
+                    matched_join_alias = join_alias
+                    break
+            
+            if matched_join_info:
+                field_type = "dimension_key" if col == matched_join_info["dim_key"] else "dimension_attr"
+                group_name = matched_join_info["dim_name"]
+            else:
+                field_type = "dimension_attr"
+                group_name = "Other Dimensions"
+        else:
+            ji = join_info[alias]
+            field_type = "dimension_key" if col == ji["dim_key"] else "dimension_attr"
+            group_name = ji["dim_name"]
+
+        # Guarantee dimension keys are grouped under their proper dimension, never "Other Dimensions"
+        if field_type == "dimension_key" and group_name == "Other Dimensions":
+            for join_alias, ji in join_info.items():
+                if col == ji["dim_key"]:
+                    group_name = ji["dim_name"]
+                    break
+
+        # Prevent duplicate visibility when a non-key dimension is also used by a measure.
+        # Keep dimension keys visible and ordered first within their dimension group.
+        if field_type != "dimension_key":
+            if dim_name in measure_used_names:
+                continue
+            if ref in measure_used_refs:
+                continue
+
         seen.add(dim_name)
         fields.append(MvField(
             name=dim_name,
             label=label,
             field_type=field_type,
-            group_name=ji["dim_name"],
+            group_name=group_name,
             default_show=True,
         ))
 
@@ -1110,9 +1166,38 @@ def _parse_metric_view_yaml(
             for f in fields
         )
         key_name = ji["dim_key"]
-        if has_group_key or key_name in seen:
+        if has_group_key:
+            LOGGER.info(f"Skipping synthetic key for {alias}: has_group_key=True")
             continue
 
+        if key_name in seen:
+            promoted = False
+            for idx, field in enumerate(fields):
+                if field.name != key_name:
+                    continue
+                # Reuse existing non-measure field and anchor it as the group key.
+                if field.field_type == "measure":
+                    continue
+                fields[idx] = MvField(
+                    name=field.name,
+                    label=field.label,
+                    field_type="dimension_key",
+                    group_name=group_name,
+                    default_show=field.default_show,
+                )
+                promoted = True
+                LOGGER.info(
+                    f"Promoted existing field as dimension key for {alias}: key_name={key_name} group_name={group_name}"
+                )
+                break
+
+            if not promoted:
+                LOGGER.info(
+                    f"Skipping synthetic key for {alias}: key_name_in_seen=True but no reusable dimension field for {key_name}"
+                )
+            continue
+
+        LOGGER.info(f"Creating synthetic dimension key: alias={alias} key_name={key_name} group_name={group_name}")
         seen.add(key_name)
         fields.append(MvField(
             name=key_name,
@@ -1336,7 +1421,11 @@ def get_logged_in_user() -> str:
     return user if user else "unknown"
 
 
-def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequest:
+def build_request_from_grid_state(
+    column_state,
+    max_rows_value,
+    mv_def: MetricViewDef | None = None,
+) -> OlapQueryRequest:
     max_rows = sanitize_max_rows(max_rows_value)
 
     if not column_state:
@@ -1344,6 +1433,8 @@ def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequ
     
     row_fields: list[str] = []
     col_fields: list[str] = []
+    metric_fields: list[str] = []
+    measure_names = {f.name for f in mv_def.measures} if mv_def else set()
 
     for col_state in column_state:
         col_id = col_state.get("colId") or col_state.get("field")
@@ -1360,14 +1451,27 @@ def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequ
             col_fields.append(col_id)
             continue
         if not col_state.get("hide", False):
-            row_fields.append(col_id)
+            if col_id in measure_names:
+                metric_fields.append(col_id)
+            else:
+                row_fields.append(col_id)
 
-    LOGGER.debug(f"Parsed grid state into request: row_fields={row_fields}, col_fields={col_fields}, max_rows={max_rows}")
+    row_fields = list(dict.fromkeys(row_fields))
+    col_fields = list(dict.fromkeys(col_fields))
+    metric_fields = list(dict.fromkeys(metric_fields))
+
+    LOGGER.debug(
+        "Parsed grid state into request: row_fields=%s, col_fields=%s, metric_fields=%s, max_rows=%s",
+        row_fields,
+        col_fields,
+        metric_fields,
+        max_rows,
+    )
 
     return OlapQueryRequest(
         rows=row_fields,
         columns=col_fields,
-        metrics=[],
+        metrics=metric_fields,
         filters={},
         max_rows=max_rows,
     )
@@ -1535,7 +1639,6 @@ def build_column_defs(
     Measures are only included when they appear in the SQL result.
     """
     defs: list[dict] = []
-    df_cols: set[str] = set(df.columns)
 
     def _is_visible(field_name: str) -> bool:
         if visible_fields is None:
@@ -1550,7 +1653,16 @@ def build_column_defs(
 
     for group_name in groups_seen:
         children: list[dict] = []
-        for f in mv_def.fields_for_group(group_name):
+        # Sort fields so dimension_key fields appear first within each group
+        group_fields = mv_def.fields_for_group(group_name)
+        group_fields_sorted = sorted(
+            group_fields,
+            key=lambda f: (
+                0 if f.field_type == "dimension_key" else 1,  # Keys first
+                f.name,  # Then alphabetically
+            )
+        )
+        for f in group_fields_sorted:
             if f.field_type == "measure":
                 continue
             children.append({
@@ -1567,21 +1679,22 @@ def build_column_defs(
         if children:
             defs.append({"headerName": group_name, "children": children})
 
-    # Measures — only for those returned by the current SQL result
+    # Measures — include all model measures so they are always available
+    # in the right-side panel, even if the current report did not request
+    # them in the initial query.
     measure_children: list[dict] = []
     for f in mv_def.measures:
-        if f.name in df_cols:
-            measure_children.append({
-                "field": f.name,
-                "headerName": f.label,
-                "isDimension": False,
-                "sortable": True,
-                "filter": False,
-                "resizable": True,
-                "type": "numericColumn",
-                "enableValue": True,
-                "hide": not _is_visible(f.name),
-            })
+        measure_children.append({
+            "field": f.name,
+            "headerName": f.label,
+            "isDimension": False,
+            "sortable": True,
+            "filter": False,
+            "resizable": True,
+            "type": "numericColumn",
+            "enableValue": True,
+            "hide": not _is_visible(f.name),
+        })
     if measure_children:
         defs.append({"headerName": "Metrics", "children": measure_children})
 
@@ -1845,6 +1958,17 @@ app.layout = html.Div(
                                 "border": "1px solid #d1d5db",
                             },
                         ),
+                        html.Button(
+                            "Model",
+                            id="open-model-yaml-btn",
+                            n_clicks=0,
+                            style={
+                                "height": "38px",
+                                "padding": "0 14px",
+                                "background": "#f3f4f6",
+                                "border": "1px solid #d1d5db",
+                            },
+                        ),
                     ],
                 ),
             ],
@@ -2051,6 +2175,89 @@ app.layout = html.Div(
                         html.Div(
                             "Read-only filters from the selected report YAML.",
                             style={"fontSize": "12px", "color": "#6b7280", "marginTop": "6px"},
+                        ),
+                    ],
+                )
+            ],
+        ),
+        html.Div(
+            id="model-yaml-modal",
+            style={
+                "display": "none",
+                "position": "fixed",
+                "inset": "0",
+                "background": "rgba(0, 0, 0, 0.35)",
+                "zIndex": 2050,
+                "alignItems": "center",
+                "justifyContent": "center",
+            },
+            children=[
+                html.Div(
+                    style={
+                        "width": "900px",
+                        "maxWidth": "95vw",
+                        "background": "#fff",
+                        "borderRadius": "10px",
+                        "padding": "14px",
+                        "boxSizing": "border-box",
+                        "boxShadow": "0 10px 30px rgba(0, 0, 0, 0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
+                            children=[
+                                html.Div("Model YAML", style={"fontWeight": "700"}),
+                                html.Button(
+                                    "X",
+                                    id="close-model-yaml-x-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "background": "#fff",
+                                        "borderRadius": "6px",
+                                        "padding": "4px 8px",
+                                        "cursor": "pointer",
+                                        "fontWeight": "700",
+                                    },
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            "Selected Metric View YAML",
+                            style={"fontWeight": "600", "marginBottom": "6px"},
+                        ),
+                        dcc.Textarea(
+                            id="model-metric-view-yaml-editor",
+                            value="",
+                            readOnly=True,
+                            style={
+                                "width": "100%",
+                                "height": "220px",
+                                "padding": "8px",
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                                "boxSizing": "border-box",
+                                "background": "#f9fafb",
+                                "marginBottom": "10px",
+                            },
+                        ),
+                        html.Div(
+                            "Selected Report YAML",
+                            style={"fontWeight": "600", "marginBottom": "6px"},
+                        ),
+                        dcc.Textarea(
+                            id="model-report-yaml-editor",
+                            value="",
+                            readOnly=True,
+                            style={
+                                "width": "100%",
+                                "height": "220px",
+                                "padding": "8px",
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                                "boxSizing": "border-box",
+                                "background": "#f9fafb",
+                            },
                         ),
                     ],
                 )
@@ -2561,6 +2768,72 @@ def on_report_filter_json_modal_toggle(open_clicks, close_x_clicks, active_repor
         return shown, json.dumps(report_filters, indent=2)
 
     return hidden, no_update
+
+
+@app.callback(
+    Output("model-yaml-modal", "style"),
+    Output("model-metric-view-yaml-editor", "value"),
+    Output("model-report-yaml-editor", "value"),
+    Input("open-model-yaml-btn", "n_clicks"),
+    Input("close-model-yaml-x-btn", "n_clicks"),
+    State("model-selector", "value"),
+    State("metric-view-defs-store", "data"),
+    State("active-report-store", "data"),
+    State("report-selector", "value"),
+    prevent_initial_call=True,
+)
+def on_model_yaml_modal_toggle(
+    open_clicks,
+    close_clicks,
+    model_id,
+    metric_view_defs_data,
+    active_report_data,
+    report_selector_value,
+):
+    ctx = dash.callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    hidden = {
+        "display": "none",
+        "position": "fixed",
+        "inset": "0",
+        "background": "rgba(0, 0, 0, 0.35)",
+        "zIndex": 2050,
+        "alignItems": "center",
+        "justifyContent": "center",
+    }
+    shown = {
+        **hidden,
+        "display": "flex",
+    }
+
+    if triggered == "open-model-yaml-btn.n_clicks":
+        metric_yaml = "No metric view selected."
+        selected_model = _get_mv_def_from_store(metric_view_defs_data, str(model_id or ""))
+        if selected_model is not None:
+            yaml_text = _fetch_metric_view_yaml(
+                selected_model.catalog,
+                selected_model.schema,
+                selected_model.metric_view_name,
+            )
+            metric_yaml = yaml_text or "Could not load metric view YAML."
+
+        selected_report_id = ""
+        if isinstance(active_report_data, dict):
+            selected_report_id = str(active_report_data.get("id") or "")
+        if not selected_report_id:
+            selected_report_id = str(report_selector_value or "")
+
+        report_yaml = "No report selected."
+        if selected_report_id and selected_report_id in REPORT_DEFS:
+            try:
+                report_yaml = _yaml_safe_dump(REPORT_DEFS[selected_report_id])
+            except Exception:
+                report_yaml = "Could not render report YAML."
+
+        return shown, metric_yaml, report_yaml
+
+    return hidden, no_update, no_update
 
 
 @app.callback(
@@ -3118,7 +3391,7 @@ def on_grid_state_change(catalog_value,
         request = (
             build_default_request(selected_model, max_rows)
             if rebuild_cols
-            else build_request_from_grid_state(effective_column_state, max_rows)
+            else build_request_from_grid_state(effective_column_state, max_rows, mv_def=selected_model)
         )
         merged_filters: dict[str, dict[str, list] | list] = dict(request.filters or {})
         merged_filters.update(runtime_filters)
