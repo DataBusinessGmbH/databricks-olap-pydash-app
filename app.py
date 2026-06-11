@@ -1544,7 +1544,7 @@ def build_column_defs(
                 "filter": False,
                 "resizable": True,
                 "hide": not _is_visible(f.name),
-                "enablePivot": True,
+                "enablePivot": False,
                 "enableRowGroup": True,
             })
         if children:
@@ -1574,8 +1574,8 @@ def build_column_defs(
 def build_grid_options() -> dict:
     return {
         "animateRows": True,
-        "rowGroupPanelShow": "always",
-        "pivotPanelShow": "always",
+        "rowGroupPanelShow": "never",
+        "pivotPanelShow": "never",
         "getContextMenuItems": {"function": "getCustomContextMenuItems(params)"},
         "groupDisplayType": "multipleColumns",
         "groupDefaultExpanded": -1,
@@ -1590,7 +1590,12 @@ def build_grid_options() -> dict:
                     "labelKey": "columns",
                     "iconKey": "columns",
                     "toolPanel": "agColumnsToolPanel",
-                    "toolPanelParams": {"suppressRowGroups": False},
+                    "toolPanelParams": {
+                        "suppressRowGroups": True,
+                        "suppressPivotMode": True,
+                        "suppressPivots": True,
+                        "suppressValues": True,
+                    },
                 },
             ],
             "defaultToolPanel": "columns",
