@@ -1677,7 +1677,7 @@ def build_column_defs(
                 "enableRowGroup": True,
             })
         if children:
-            defs.append({"headerName": group_name, "children": children})
+            defs.append({"headerName": group_name, "children": children, "openByDefault": False})
 
     # Measures — include all model measures so they are always available
     # in the right-side panel, even if the current report did not request
@@ -1696,7 +1696,7 @@ def build_column_defs(
             "hide": not _is_visible(f.name),
         })
     if measure_children:
-        defs.append({"headerName": "Metrics", "children": measure_children})
+        defs.append({"headerName": "Metrics", "children": measure_children, "openByDefault": False})
 
     return defs
 
@@ -1721,6 +1721,7 @@ def build_grid_options() -> dict:
                     "iconKey": "columns",
                     "toolPanel": "agColumnsToolPanel",
                     "toolPanelParams": {
+                        "contractColumnSelection": True,
                         "suppressRowGroups": True,
                         "suppressPivotMode": True,
                         "suppressPivots": True,
