@@ -2321,10 +2321,6 @@ def initialize_session(href):
 
     LOGGER.info("initialize_session: browser page load, reinitializing session state")
 
-    # Reset process globals so this request's token is used for every SQL call.
-    global BACKEND_EXECUTOR   
-    BACKEND_EXECUTOR = None
-
     # --- Logged-in user ---------------------------------------------------
     try:
         logged_in_user = get_logged_in_user()
@@ -3028,6 +3024,9 @@ def on_grid_state_change(catalog_value,
     #print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
     #print(f"[on_grid_state_change] manual_filter_data={manual_filter_data}", flush=True)
 
+    LOGGER.info("Grid state change: catalog=%s schema=%s model=%s report=%s max_rows=%s trigger=%s",
+                 catalog_value, schema_value, model_id, report_id, max_rows_value, triggered)
+    LOGGER.info("Grid state change: column state=%s", column_state)    
     effective_column_state = column_state
     if isinstance(column_trigger, dict):
         candidate = column_trigger.get("columnState")
@@ -3040,7 +3039,7 @@ def on_grid_state_change(catalog_value,
         candidate = filter_trigger.get("filterModel")
         if isinstance(candidate, dict):
             filter_model = candidate
-            print(f"[on_grid_state_change] using filterModel from Store: {filter_model}", flush=True)
+            #print(f"[on_grid_state_change] using filterModel from Store: {filter_model}", flush=True)
 
     manual_filters: dict[str, dict[str, list]] = {}
     if isinstance(manual_filter_data, dict):
@@ -3082,6 +3081,7 @@ def on_grid_state_change(catalog_value,
         use_grid_state_for_report = (
             "column-change-trigger.data" in triggered
             or "olap-grid.columnState" in triggered
+            or "manual-filter-store.data" in triggered
         )
         report_column_state = effective_column_state if use_grid_state_for_report else None
 
