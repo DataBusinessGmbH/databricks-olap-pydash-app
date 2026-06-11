@@ -176,11 +176,11 @@ class DatabricksSqlBackend:
     def _token_from_request_header() -> str:
         token = ""
         try:
-            LOGGER.info("Attempting to extract token from request headers")
+            LOGGER.debug("Attempting to extract token from request headers")
             token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
             user  = flask_request.headers.get("x-forwarded-user"),
             email = flask_request.headers.get("x-forwarded-email"),
-            LOGGER.info("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
+            LOGGER.debug("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
         except RuntimeError:
             # No active request context; fallback to env token below.
             token = ""
@@ -206,8 +206,8 @@ class DatabricksSqlBackend:
             "http_path": self._config.http_path,
             "access_token": access_token,
         }
-        LOGGER.info("Connection parameters (excluding token): %s", {k: v for k, v in connect_kwargs.items() if k != "access_token"})
-        LOGGER.info("Token length: %d characters", len(access_token))
+        LOGGER.debug("Connection parameters (excluding token): %s", {k: v for k, v in connect_kwargs.items() if k != "access_token"})
+        LOGGER.debug("Token length: %d characters", len(access_token))
         if self._config.default_catalog:
             connect_kwargs["catalog"] = self._config.default_catalog
         if self._config.default_schema:

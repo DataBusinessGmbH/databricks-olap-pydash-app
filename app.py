@@ -3033,7 +3033,7 @@ def on_grid_state_change(catalog_value,
         candidate = column_trigger.get("columnState")
         if isinstance(candidate, list):
             effective_column_state = candidate
-            print(f"[on_grid_state_change] using columnState from Store: {effective_column_state}", flush=True)
+            #print(f"[on_grid_state_change] using columnState from Store: {effective_column_state}", flush=True)
 
     filter_model = {}
     if isinstance(filter_trigger, dict):
