@@ -1122,6 +1122,23 @@ def _parse_metric_view_yaml(
             default_show=False,
         ))
 
+    group_order: list[str] = []
+    for field in fields:
+        if field.group_name not in group_order:
+            group_order.append(field.group_name)
+
+    ordered_dimension_fields: list[MvField] = []
+    for group_name in group_order:
+        group_fields = [f for f in fields if f.group_name == group_name]
+        ordered_dimension_fields.extend(
+            f for f in group_fields if f.field_type == "dimension_key"
+        )
+        ordered_dimension_fields.extend(
+            f for f in group_fields if f.field_type == "dimension_attr"
+        )
+
+    fields = ordered_dimension_fields
+
     for measure in measures_raw:
         m_name = str(measure.get("name") or "").strip()
         m_label = str(measure.get("display_name") or m_name or "").strip() or m_name
