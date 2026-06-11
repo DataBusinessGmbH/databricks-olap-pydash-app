@@ -732,8 +732,8 @@ def list_schema_names(catalog: str) -> list[str]:
         try:
             df = _run_sql(sql, default_catalog=catalog)
         except Exception as e:
-            LOGGER.info("Schema listing query failed for %s: %s", catalog, sql)
-            LOGGER.info("Schema listing query error", exc_info=e)
+            LOGGER.warning("Schema listing query failed for %s: %s", catalog, sql)
+            LOGGER.warning("Schema listing query error", exc_info=e)
             continue
 
         if df.empty:
@@ -949,7 +949,7 @@ def _discover_metric_view_names(catalog: str, schema: str) -> list[str]:
         try:
             df = _run_sql(sql, default_catalog=catalog)
         except Exception:
-            LOGGER.info("Metric view discovery query failed: %s", sql)
+            LOGGER.warning("Metric view discovery query failed: %s", sql)
             continue
 
         if df.empty:
@@ -1011,7 +1011,7 @@ def _fetch_metric_view_yaml(catalog: str, schema: str, metric_view_name: str) ->
         try:
             df = _run_sql(sql, default_catalog=catalog)
         except Exception:
-            LOGGER.info("Metric view describe query failed for %s: %s", metric_view_name, sql)
+            LOGGER.warning("Metric view describe query failed for %s: %s", metric_view_name, sql)
             continue
 
         yaml_text = (
@@ -1345,7 +1345,7 @@ def build_request_from_grid_state(column_state, max_rows_value) -> OlapQueryRequ
         if not col_state.get("hide", False):
             row_fields.append(col_id)
 
-    LOGGER.info(f"Parsed grid state into request: row_fields={row_fields}, col_fields={col_fields}, max_rows={max_rows}")
+    LOGGER.debug(f"Parsed grid state into request: row_fields={row_fields}, col_fields={col_fields}, max_rows={max_rows}")
 
     return OlapQueryRequest(
         rows=row_fields,
@@ -1616,7 +1616,7 @@ def api_filter_values():
         flush=True,
     )
 
-    LOGGER.info(
+    LOGGER.debug(
         "Lazy filter values request received: model_id=%s field_name=%s max_values=%s",
         model_id,
         field_name,
@@ -1633,7 +1633,7 @@ def api_filter_values():
 
     try:
         values = fetch_filter_values(model_id, field_name, max_values=max_values)
-        LOGGER.info(
+        LOGGER.debug(
             "Lazy filter values response: model_id=%s field_name=%s count=%s",
             model_id,
             field_name,
@@ -3017,16 +3017,16 @@ def on_grid_state_change(catalog_value,
     """
     ctx = dash.callback_context
     triggered = {t["prop_id"] for t in ctx.triggered}
-    LOGGER.info(f"Grid state change triggered by: {triggered}")
+    LOGGER.debug(f"Grid state change triggered by: {triggered}")
 
     # If critical context is missing, return early to avoid hitting the backend.
     if catalog_value is None or schema_value is None or model_id is None or \
        report_id is None or max_rows_value is None:
         return [], []
 
-    print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
-    print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
-    print(f"[on_grid_state_change] manual_filter_data={manual_filter_data}", flush=True)
+    #print(f"[on_grid_state_change] column_trigger={column_trigger}", flush=True)
+    #print(f"[on_grid_state_change] filter_trigger={filter_trigger}", flush=True)
+    #print(f"[on_grid_state_change] manual_filter_data={manual_filter_data}", flush=True)
 
     effective_column_state = column_state
     if isinstance(column_trigger, dict):
@@ -3102,7 +3102,7 @@ def on_grid_state_change(catalog_value,
         merged_filters.update(runtime_filters)
         request.filters = merged_filters
 
-    LOGGER.info(
+    LOGGER.debug(
         "Grid state change: model=%s rows=%s pivots=%s filters=%s max_rows=%s trigger=%s raw_filter_model=%s",
         model_id,
         request.rows,

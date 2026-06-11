@@ -31,7 +31,7 @@ def _in_filter_sql(expr: str, allowed_values: list) -> str | None:
     literals = [v for v in literals if v is not None]
     if not literals:
         return None
-    return f"CAST({expr} AS STRING) IN ({', '.join(literals)})"
+    return f"CAST(TRIM({expr}) AS STRING) IN ({', '.join(literals)})"
 
 
 def _not_in_filter_sql(expr: str, excluded_values: list) -> str | None:
@@ -39,7 +39,7 @@ def _not_in_filter_sql(expr: str, excluded_values: list) -> str | None:
     literals = [v for v in literals if v is not None]
     if not literals:
         return None
-    return f"(COALESCE(CAST({expr} AS STRING), '') NOT IN ({', '.join(literals)}))"
+    return f"(COALESCE(CAST(TRIM({expr}) AS STRING), '') NOT IN ({', '.join(literals)}))"
 
 
 def _normalize_filter_spec(spec) -> dict[str, list]:
