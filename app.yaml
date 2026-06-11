@@ -6,8 +6,6 @@ env:
     value: 'testdata'
   - name: 'APP_LOG_LEVEL'
     value: 'INFO'
-  - name: 'DATABRICKS_REPORTING_CATALOGS'
-    value: 'testdata'
   - name: 'DATABRICKS_HTTP_PATH'
     value: '/sql/1.0/warehouses/50c52a56ac828f66'
     
