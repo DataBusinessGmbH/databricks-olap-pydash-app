@@ -1,4 +1,5 @@
 var dagfuncs = window.dashAgGridFunctions = window.dashAgGridFunctions || {};
+var dagcomponentfuncs = window.dashAgGridComponentFunctions = window.dashAgGridComponentFunctions || {};
 
 console.info("[dashAgGridFunctions] asset loaded");
 
@@ -799,4 +800,223 @@ dagfuncs.installFieldLookupHotkey();
 // Expose for AG Grid dashGridOptions callback usage.
 window.onGridFilterChanged = dagfuncs.onGridFilterChanged;
 window.onGridColumnStateChanged = dagfuncs.onGridColumnStateChanged;
+
+dagcomponentfuncs.YamlInfoToolPanel = function () {
+  const ReactObj = window.React || React;
+
+  const readInfoFromDom = function () {
+    const titleEl = document.getElementById("right-panel-info-title");
+    const metricEl = document.getElementById("right-panel-metric-yaml");
+    const reportEl = document.getElementById("right-panel-report-yaml");
+
+    return {
+      title: (titleEl && titleEl.textContent) || "Information",
+      metricYaml: (metricEl && metricEl.value) || "No metric view selected.",
+      reportYaml: (reportEl && reportEl.value) || "No report selected.",
+    };
+  };
+
+  const [info, setInfo] = ReactObj.useState(readInfoFromDom);
+  const [splitPct, setSplitPct] = ReactObj.useState(50);
+  const dragRef = ReactObj.useRef({ active: false, startY: 0, startPct: 50 });
+
+  ReactObj.useEffect(function () {
+    const syncInfo = function () {
+      const next = readInfoFromDom();
+      setInfo(function (prev) {
+        if (
+          prev.title === next.title &&
+          prev.metricYaml === next.metricYaml &&
+          prev.reportYaml === next.reportYaml
+        ) {
+          return prev;
+        }
+        return next;
+      });
+    };
+
+    syncInfo();
+
+    const intervalId = window.setInterval(syncInfo, 400);
+    let observer = null;
+    if (window.MutationObserver) {
+      const targets = [
+        document.getElementById("right-panel-info-title"),
+        document.getElementById("right-panel-metric-yaml"),
+        document.getElementById("right-panel-report-yaml"),
+      ].filter(Boolean);
+
+      if (targets.length > 0) {
+        observer = new MutationObserver(syncInfo);
+        targets.forEach(function (el) {
+          observer.observe(el, {
+            childList: true,
+            characterData: true,
+            subtree: true,
+            attributes: true,
+          });
+        });
+      }
+    }
+
+    return function () {
+      window.clearInterval(intervalId);
+      if (observer) {
+        observer.disconnect();
+      }
+    };
+  }, []);
+
+  ReactObj.useEffect(function () {
+    const onMouseMove = function (event) {
+      if (!dragRef.current.active) {
+        return;
+      }
+
+      const panelEl = document.getElementById("yaml-info-tool-panel-root");
+      if (!panelEl) {
+        return;
+      }
+
+      const rect = panelEl.getBoundingClientRect();
+      const usableHeight = Math.max(rect.height - 56, 120);
+      const deltaY = event.clientY - dragRef.current.startY;
+      const deltaPct = (deltaY / usableHeight) * 100;
+      const nextPct = Math.min(80, Math.max(20, dragRef.current.startPct + deltaPct));
+      setSplitPct(nextPct);
+    };
+
+    const onMouseUp = function () {
+      dragRef.current.active = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return function () {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, []);
+
+  const startDrag = function (event) {
+    dragRef.current.active = true;
+    dragRef.current.startY = event.clientY;
+    dragRef.current.startPct = splitPct;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const sectionHeaderStyle = {
+    fontWeight: "600",
+    fontSize: "14px",
+    marginBottom: "6px",
+  };
+
+  const yamlBoxStyle = {
+    whiteSpace: "pre",
+    overflow: "auto",
+    fontFamily: "monospace",
+    fontSize: "12px",
+    margin: 0,
+    padding: "8px",
+    border: "1px solid #d1d5db",
+    borderRadius: "6px",
+    background: "#f9fafb",
+  };
+
+  return React.createElement(
+    "div",
+    {
+      id: "yaml-info-tool-panel-root",
+      style: {
+        height: "100%",
+        padding: "10px",
+        boxSizing: "border-box",
+        fontFamily: "Arial, sans-serif",
+        display: "flex",
+        flexDirection: "column",
+      },
+    },
+    [
+      React.createElement(
+        "div",
+        {
+          key: "title",
+          style: {
+            fontWeight: "700",
+            marginBottom: "10px",
+            fontSize: "14px",
+          },
+        },
+        info.title
+      ),
+      React.createElement(
+        "div",
+        {
+          key: "metric-wrap",
+          style: {
+            height: splitPct + "%",
+            minHeight: "80px",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          },
+        },
+        [
+          React.createElement("div", { key: "metric-header", style: sectionHeaderStyle }, "Metric View Definition YAML"),
+          React.createElement(
+            "pre",
+            {
+              key: "metric-yaml",
+              style: { ...yamlBoxStyle, flex: 1, minHeight: 0 },
+            },
+            info.metricYaml
+          ),
+        ]
+      ),
+      React.createElement("div", {
+        key: "splitter",
+        onMouseDown: startDrag,
+        style: {
+          height: "10px",
+          cursor: "row-resize",
+          margin: "4px 0",
+          borderTop: "1px solid #d1d5db",
+          borderBottom: "1px solid #d1d5db",
+          background: "linear-gradient(to bottom, #f8fafc, #e5e7eb)",
+          borderRadius: "4px",
+          flex: "0 0 auto",
+        },
+      }),
+      React.createElement(
+        "div",
+        {
+          key: "report-wrap",
+          style: {
+            height: (100 - splitPct) + "%",
+            minHeight: "80px",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          },
+        },
+        [
+          React.createElement("div", { key: "report-header", style: sectionHeaderStyle }, "Report Definition YAML"),
+          React.createElement(
+            "pre",
+            {
+              key: "report-yaml",
+              style: { ...yamlBoxStyle, flex: 1, minHeight: 0 },
+            },
+            info.reportYaml
+          ),
+        ]
+      ),
+    ]
+  );
+};
+
+window.YamlInfoToolPanel = dagcomponentfuncs.YamlInfoToolPanel;
 window.getCustomContextMenuItems = dagfuncs.getCustomContextMenuItems;

@@ -1728,6 +1728,13 @@ def build_grid_options() -> dict:
                         "suppressValues": True,
                     },
                 },
+                {
+                    "id": "information",
+                    "labelDefault": "Information",
+                    "labelKey": "information",
+                    "iconKey": "menu",
+                    "toolPanel": "YamlInfoToolPanel",
+                },
             ],
             "defaultToolPanel": "columns",
         },
@@ -1813,6 +1820,12 @@ app.layout = html.Div(
         dcc.Store(id="active-report-store",   data={"id": "", "timestamp": pd.Timestamp.utcnow().isoformat()}),        
         dcc.Store(id="field-filter-values-target", data={"mode": "include"}),
         dcc.Store(id="field-filter-modal-context", data={}),
+        html.Button(id="open-report-filter-json-btn", n_clicks=0, style={"display": "none"}),
+        html.Button(id="open-model-yaml-btn", n_clicks=0, style={"display": "none"}),
+        # Hidden data sources for custom right-side "Information" tool panel
+        dcc.Textarea(id="right-panel-metric-yaml", value="", style={"display": "none"}),
+        dcc.Textarea(id="right-panel-report-yaml", value="", style={"display": "none"}),
+        html.Div(id="right-panel-info-title", children="", style={"display": "none"}),
         dcc.Input(id="field-filter-active-model", value="", style={"display": "none"}),
         dcc.Input(
             id="field-filter-active-field",
@@ -1942,33 +1955,6 @@ app.layout = html.Div(
                             value=DEFAULT_MAX_ROWS,
                             debounce=True,
                             style={"width": "100%", "padding": "8px"},
-                        ),
-                    ],
-                ),
-                html.Div(
-                    style={"display": "flex", "gap": "16px", "alignItems": "flex-end"},
-                    children=[
-                        html.Button(
-                            "Static Filters",
-                            id="open-report-filter-json-btn",
-                            n_clicks=0,
-                            style={
-                                "height": "38px",
-                                "padding": "0 14px",
-                                "background": "#f3f4f6",
-                                "border": "1px solid #d1d5db",
-                            },
-                        ),
-                        html.Button(
-                            "Model",
-                            id="open-model-yaml-btn",
-                            n_clicks=0,
-                            style={
-                                "height": "38px",
-                                "padding": "0 14px",
-                                "background": "#f3f4f6",
-                                "border": "1px solid #d1d5db",
-                            },
                         ),
                     ],
                 ),
@@ -3168,6 +3154,52 @@ def on_model_yaml_modal_toggle(
         return shown, metric_yaml, report_yaml
 
     return hidden, no_update, no_update
+
+
+@app.callback(
+    Output("right-panel-metric-yaml", "value"),
+    Output("right-panel-report-yaml", "value"),
+    Output("right-panel-info-title", "children"),
+    Input("model-selector", "value"),
+    Input("active-report-store", "data"),
+    Input("report-selector", "value"),
+    State("metric-view-defs-store", "data"),
+    prevent_initial_call=False,
+)
+def update_right_panel_information(
+    model_id,
+    active_report_data,
+    report_selector_value,
+    metric_view_defs_data,
+):
+    metric_yaml = "No metric view selected."
+    report_yaml = "No report selected."
+    info_title = "Information"
+
+    selected_model = _get_mv_def_from_store(metric_view_defs_data, str(model_id or ""))
+    if selected_model is not None:
+        yaml_text = _fetch_metric_view_yaml(
+            selected_model.catalog,
+            selected_model.schema,
+            selected_model.metric_view_name,
+        )
+        metric_yaml = yaml_text or "Could not load metric view YAML."
+        info_title = f"Information - {selected_model.metric_view_name}"
+
+    selected_report_id = ""
+    if isinstance(active_report_data, dict):
+        selected_report_id = str(active_report_data.get("id") or "")
+    if not selected_report_id:
+        selected_report_id = str(report_selector_value or "")
+
+    if selected_report_id and selected_report_id in REPORT_DEFS:
+        try:
+            report_yaml = _yaml_safe_dump(REPORT_DEFS[selected_report_id])
+            info_title = f"{info_title} / {selected_report_id}"
+        except Exception:
+            report_yaml = "Could not render report YAML."
+
+    return metric_yaml, report_yaml, info_title
 
 
 @app.callback(
