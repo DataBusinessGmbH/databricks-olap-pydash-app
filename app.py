@@ -23,7 +23,7 @@ from databricks import sql
 
 import dash_ag_grid as dag
 import pandas as pd
-from dash import Dash, Input, Output, State, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, State, dcc, html, no_update
 import dash
 
 from src.model import MetricViewDef, MvField, metric_view_def_to_dict, metric_view_def_from_dict
@@ -2031,17 +2031,6 @@ app.layout = html.Div(
                         "border": "1px solid #d1d5db",
                     },
                 ),
-                html.Button(
-                    "Clear Filters",
-                    id="clear-filters-btn",
-                    n_clicks=0,
-                    style={
-                        "height": "38px",
-                        "padding": "0 14px",
-                        "background": "#f3f4f6",
-                        "border": "1px solid #d1d5db",
-                    },
-                ),
             ],
         ),
         dcc.Textarea(
@@ -2069,6 +2058,7 @@ app.layout = html.Div(
                     style={
                         "width": "760px",
                         "maxWidth": "95vw",
+                        "minHeight": "430px",
                         "background": "#fff",
                         "borderRadius": "10px",
                         "padding": "14px",
@@ -2095,23 +2085,145 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-                        dcc.Textarea(
-                            id="server-filter-editor",
-                            value="{}",
-                            readOnly=True,
+                        dcc.Tabs(
+                            id="filter-json-tabs",
+                            value="list",
+                            parent_style={"marginBottom": "8px"},
                             style={
-                                "width": "100%",
-                                "height": "240px",
-                                "padding": "8px",
-                                "fontFamily": "monospace",
-                                "fontSize": "12px",
-                                "boxSizing": "border-box",
-                                "background": "#f9fafb",
+                                "border": "none",
+                                "background": "transparent",
                             },
-                        ),
-                        html.Div(
-                            'Example: {"year": {"in": [2024]}, "region": {"not_in": ["APAC"]}}',
-                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "6px"},
+                            colors={
+                                "border": "transparent",
+                                "primary": "#2563eb",
+                                "background": "transparent",
+                            },
+                            children=[
+                                dcc.Tab(
+                                    label="Filters",
+                                    value="list",
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "borderRadius": "6px",
+                                        "padding": "5px 12px",
+                                        "marginRight": "8px",
+                                        "fontSize": "12px",
+                                        "lineHeight": "1.2",
+                                        "fontWeight": "600",
+                                        "background": "#f3f4f6",
+                                        "minHeight": "30px",
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "justifyContent": "center",
+                                    },
+                                    selected_style={
+                                        "border": "1px solid #93c5fd",
+                                        "borderRadius": "6px",
+                                        "padding": "5px 12px",
+                                        "marginRight": "8px",
+                                        "fontSize": "12px",
+                                        "lineHeight": "1.2",
+                                        "fontWeight": "700",
+                                        "background": "#eff6ff",
+                                        "color": "#1d4ed8",
+                                        "minHeight": "30px",
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "justifyContent": "center",
+                                    },
+                                    children=[
+                                        html.Div(
+                                            id="filter-editor-list-container",
+                                            style={"marginTop": "10px", "display": "grid", "gap": "8px"},
+                                        ),
+                                        html.Div(
+                                            style={"display": "flex", "justifyContent": "flex-end", "marginTop": "10px"},
+                                            children=[
+                                                html.Button(
+                                                    "Clear All",
+                                                    id="clear-filter-list-btn",
+                                                    n_clicks=0,
+                                                    style={
+                                                        "height": "36px",
+                                                        "padding": "0 14px",
+                                                        "background": "#fff",
+                                                        "border": "1px solid #d1d5db",
+                                                        "marginRight": "8px",
+                                                    },
+                                                ),
+                                                html.Button(
+                                                    "Apply",
+                                                    id="apply-filter-list-btn",
+                                                    n_clicks=0,
+                                                    style={
+                                                        "height": "36px",
+                                                        "padding": "0 14px",
+                                                        "background": "#f3f4f6",
+                                                        "border": "1px solid #d1d5db",
+                                                    },
+                                                ),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            id="filter-list-message",
+                                            children="",
+                                            style={"fontSize": "12px", "marginTop": "8px", "color": "#374151"},
+                                        ),
+                                    ],
+                                ),
+                                dcc.Tab(
+                                    label="JSON",
+                                    value="json",
+                                    style={
+                                        "border": "1px solid #d1d5db",
+                                        "borderRadius": "6px",
+                                        "padding": "5px 12px",
+                                        "fontSize": "12px",
+                                        "lineHeight": "1.2",
+                                        "fontWeight": "600",
+                                        "background": "#f3f4f6",
+                                        "minHeight": "30px",
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "justifyContent": "center",
+                                    },
+                                    selected_style={
+                                        "border": "1px solid #93c5fd",
+                                        "borderRadius": "6px",
+                                        "padding": "5px 12px",
+                                        "fontSize": "12px",
+                                        "lineHeight": "1.2",
+                                        "fontWeight": "700",
+                                        "background": "#eff6ff",
+                                        "color": "#1d4ed8",
+                                        "minHeight": "30px",
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "justifyContent": "center",
+                                    },
+                                    children=[
+                                        dcc.Textarea(
+                                            id="server-filter-editor",
+                                            value="{}",
+                                            readOnly=True,
+                                            style={
+                                                "width": "100%",
+                                                "height": "240px",
+                                                "marginTop": "8px",
+                                                "padding": "8px",
+                                                "fontFamily": "monospace",
+                                                "fontSize": "12px",
+                                                "boxSizing": "border-box",
+                                                "background": "#f9fafb",
+                                            },
+                                        ),
+                                        html.Div(
+                                            'Example: {"year": {"in": [2024]}, "region": {"not_in": ["APAC"]}}',
+                                            style={"fontSize": "12px", "color": "#6b7280", "marginTop": "6px"},
+                                        ),
+                                    ],
+                                ),
+                            ],
                         ),
                     ],
                 )
@@ -2692,6 +2804,7 @@ def on_model_or_namespace_or_report_change(
 @app.callback(
     Output("filter-json-modal", "style"),
     Output("server-filter-editor", "value"),
+    Output("filter-json-tabs", "value"),
     Input("open-filter-json-btn", "n_clicks"),
     Input("close-filter-json-x-btn", "n_clicks"),
     State("manual-filter-store", "data"),
@@ -2721,9 +2834,229 @@ def on_filter_json_modal_toggle(open_clicks, close_x_clicks, manual_filter_data)
             candidate = manual_filter_data.get("filters")
             if isinstance(candidate, dict):
                 filters = candidate
-        return shown, json.dumps(filters, indent=2)
+        return shown, json.dumps(filters, indent=2), "list"
 
-    return hidden, no_update
+    return hidden, no_update, no_update
+
+
+@app.callback(
+    Output("filter-editor-list-container", "children"),
+    Input("open-filter-json-btn", "n_clicks"),
+    Input("manual-filter-store", "data"),
+    prevent_initial_call=True,
+)
+def refresh_filter_editor_list(open_clicks, manual_filter_data):
+    filters = {}
+    if isinstance(manual_filter_data, dict):
+        candidate = manual_filter_data.get("filters")
+        if isinstance(candidate, dict):
+            filters = candidate
+
+    if not filters:
+        return [
+            html.Div(
+                "No applied filters.",
+                style={"fontSize": "13px", "color": "#6b7280"},
+            )
+        ]
+
+    rows: list = [
+        html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "200px 1fr 1fr",
+                "gap": "8px",
+                "fontWeight": "600",
+                "fontSize": "12px",
+                "color": "#374151",
+            },
+            children=[
+                html.Div("Field"),
+                html.Div("Include (csv)"),
+                html.Div("Exclude (csv)"),
+            ],
+        )
+    ]
+
+    for field in sorted(filters.keys()):
+        spec = filters.get(field)
+        includes: list[str] = []
+        excludes: list[str] = []
+
+        if isinstance(spec, dict):
+            raw_includes = spec.get("in", [])
+            raw_excludes = spec.get("not_in", [])
+            if not isinstance(raw_includes, list):
+                raw_includes = [raw_includes]
+            if not isinstance(raw_excludes, list):
+                raw_excludes = [raw_excludes]
+            includes = [str(v) for v in raw_includes if v not in (None, "")]
+            excludes = [str(v) for v in raw_excludes if v not in (None, "")]
+        elif isinstance(spec, list):
+            includes = [str(v) for v in spec if v not in (None, "")]
+        elif spec not in (None, ""):
+            includes = [str(spec)]
+
+        rows.append(
+            html.Div(
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "200px 1fr 1fr",
+                    "gap": "8px",
+                    "alignItems": "center",
+                },
+                children=[
+                    html.Div(str(field), style={"fontSize": "12px", "color": "#111827"}),
+                    dcc.Input(
+                        id={"type": "filter-include-input", "field": str(field)},
+                        type="text",
+                        value=", ".join(includes),
+                        debounce=True,
+                        style={"width": "100%", "padding": "6px", "boxSizing": "border-box"},
+                    ),
+                    dcc.Input(
+                        id={"type": "filter-exclude-input", "field": str(field)},
+                        type="text",
+                        value=", ".join(excludes),
+                        debounce=True,
+                        style={"width": "100%", "padding": "6px", "boxSizing": "border-box"},
+                    ),
+                ],
+            )
+        )
+
+    return rows
+
+
+@app.callback(
+    Output("server-filter-input", "value", allow_duplicate=True),
+    Output("filter-list-message", "children"),
+    Output("filter-list-message", "style"),
+    Input("apply-filter-list-btn", "n_clicks"),
+    State({"type": "filter-include-input", "field": ALL}, "id"),
+    State({"type": "filter-include-input", "field": ALL}, "value"),
+    State({"type": "filter-exclude-input", "field": ALL}, "id"),
+    State({"type": "filter-exclude-input", "field": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def on_apply_filter_list(
+    apply_clicks,
+    include_ids,
+    include_values,
+    exclude_ids,
+    exclude_values,
+):
+    includes_by_field: dict[str, list[str]] = {}
+    excludes_by_field: dict[str, list[str]] = {}
+
+    for idx, id_obj in enumerate(include_ids or []):
+        field = str((id_obj or {}).get("field") or "").strip()
+        if not field:
+            continue
+        includes_by_field[field] = _split_csv_values((include_values or [""])[idx] if idx < len(include_values or []) else "")
+
+    for idx, id_obj in enumerate(exclude_ids or []):
+        field = str((id_obj or {}).get("field") or "").strip()
+        if not field:
+            continue
+        excludes_by_field[field] = _split_csv_values((exclude_values or [""])[idx] if idx < len(exclude_values or []) else "")
+
+    fields = sorted(set(includes_by_field.keys()).union(set(excludes_by_field.keys())))
+    parsed: dict[str, dict[str, list[str]]] = {}
+
+    for field in fields:
+        includes = includes_by_field.get(field, [])
+        excludes = excludes_by_field.get(field, [])
+        include_set = set(includes)
+        excludes = [v for v in excludes if v not in include_set]
+
+        if not includes and not excludes:
+            continue
+
+        spec: dict[str, list[str]] = {}
+        if includes:
+            spec["in"] = includes
+        if excludes:
+            spec["not_in"] = excludes
+        if spec:
+            parsed[field] = spec
+
+    return (
+        json.dumps(parsed, indent=2),
+        "Filters updated.",
+        {"fontSize": "12px", "marginTop": "8px", "color": "#065f46"},
+    )
+
+
+@app.callback(
+    Output({"type": "filter-include-input", "field": ALL}, "value"),
+    Output({"type": "filter-exclude-input", "field": ALL}, "value"),
+    Output("filter-list-message", "children", allow_duplicate=True),
+    Output("filter-list-message", "style", allow_duplicate=True),
+    Input("clear-filter-list-btn", "n_clicks"),
+    State({"type": "filter-include-input", "field": ALL}, "value"),
+    State({"type": "filter-exclude-input", "field": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def on_clear_filter_list(clear_clicks, include_values, exclude_values):
+    cleared_includes = ["" for _ in (include_values or [])]
+    cleared_excludes = ["" for _ in (exclude_values or [])]
+    return (
+        cleared_includes,
+        cleared_excludes,
+        "",
+        {"fontSize": "12px", "marginTop": "8px", "color": "#374151"},
+    )
+
+
+@app.callback(
+    Output("server-filter-editor", "value", allow_duplicate=True),
+    Input({"type": "filter-include-input", "field": ALL}, "id"),
+    Input({"type": "filter-include-input", "field": ALL}, "value"),
+    Input({"type": "filter-exclude-input", "field": ALL}, "id"),
+    Input({"type": "filter-exclude-input", "field": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def sync_filter_json_preview(
+    include_ids,
+    include_values,
+    exclude_ids,
+    exclude_values,
+):
+    includes_by_field: dict[str, list[str]] = {}
+    excludes_by_field: dict[str, list[str]] = {}
+
+    for idx, id_obj in enumerate(include_ids or []):
+        field = str((id_obj or {}).get("field") or "").strip()
+        if not field:
+            continue
+        raw_value = (include_values or [""])[idx] if idx < len(include_values or []) else ""
+        includes_by_field[field] = _split_csv_values(raw_value)
+
+    for idx, id_obj in enumerate(exclude_ids or []):
+        field = str((id_obj or {}).get("field") or "").strip()
+        if not field:
+            continue
+        raw_value = (exclude_values or [""])[idx] if idx < len(exclude_values or []) else ""
+        excludes_by_field[field] = _split_csv_values(raw_value)
+
+    parsed: dict[str, dict[str, list[str]]] = {}
+    fields = sorted(set(includes_by_field.keys()).union(set(excludes_by_field.keys())))
+    for field in fields:
+        includes = includes_by_field.get(field, [])
+        excludes = excludes_by_field.get(field, [])
+        include_set = set(includes)
+        excludes = [v for v in excludes if v not in include_set]
+
+        spec: dict[str, list[str]] = {}
+        if includes:
+            spec["in"] = includes
+        if excludes:
+            spec["not_in"] = excludes
+        if spec:
+            parsed[field] = spec
+
+    return json.dumps(parsed, indent=2)
 
 
 @app.callback(
@@ -2835,15 +3168,6 @@ def on_model_yaml_modal_toggle(
         return shown, metric_yaml, report_yaml
 
     return hidden, no_update, no_update
-
-
-@app.callback(
-    Output("server-filter-input", "value", allow_duplicate=True),
-    Input("clear-filters-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def on_clear_filters_sync_input(clear_clicks):
-    return "{}"
 
 
 @app.callback(
@@ -3228,23 +3552,12 @@ def on_dismiss_startup_warning(n_clicks):
     Output("filter-parse-message", "children"),
     Output("filter-parse-message", "style"),
     Output("open-filter-json-btn", "children"),
-    Input("clear-filters-btn", "n_clicks"),
     Input("server-filter-input", "value"),
     State("model-selector", "value"),
     State("metric-view-defs-store", "data"),
     prevent_initial_call=True,
 )
-def on_manual_filter_change(clear_clicks, filter_text, model_id: str, metric_view_defs_data):
-    ctx = dash.callback_context
-    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
-
-    if triggered == "clear-filters-btn.n_clicks":
-        return (
-            {"timestamp": pd.Timestamp.utcnow().isoformat(), "filters": {}},
-            "Filters cleared.",
-            {"minWidth": "240px", "fontSize": "13px", "color": "#065f46"},
-            filter_button_label(0),
-        )
+def on_manual_filter_change(filter_text, model_id: str, metric_view_defs_data):
 
     mv_def = _get_mv_def_from_store(metric_view_defs_data, model_id)
     if mv_def is None:

@@ -37,3 +37,15 @@ body {
     transform: rotate(360deg);
   }
 }
+
+/* Right-side AG Grid panel typography */
+.ag-theme-alpine .ag-side-bar,
+.ag-theme-alpine .ag-side-bar .ag-side-button-label,
+.ag-theme-alpine .ag-side-bar .ag-column-select-header-label,
+.ag-theme-alpine .ag-side-bar .ag-column-select-group-title,
+.ag-theme-alpine .ag-side-bar .ag-column-select-column-label,
+.ag-theme-alpine .ag-side-bar .ag-column-select-list,
+.ag-theme-alpine .ag-side-bar .ag-column-drop-cell,
+.ag-theme-alpine .ag-side-bar .ag-column-drop-title {
+  font-size: 14px;
+}
