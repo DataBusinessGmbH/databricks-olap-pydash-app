@@ -1,0 +1,2 @@
+export DATABRICKS_HOST="adb-3788xxx363860xxx.1.azuredatabricks.net"  
+export DATABRICKS_TOKEN="dapi4ff71a4xxx9194397fd1eb0d35xxxbax-n"

@@ -26,6 +26,9 @@ import pandas as pd
 from dash import ALL, Dash, Input, Output, State, dcc, html, no_update
 import dash
 
+app = Dash(__name__)
+server = app.server
+
 from src.model import MetricViewDef, MvField, metric_view_def_to_dict, metric_view_def_from_dict
 from src.db import (
     LOGGER,
