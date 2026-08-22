@@ -1,8 +1,11 @@
 env:
-  # Table where the models are stored. It has just two fields - ModelName and ModelDefinition
-  - name: 'MODELS_TABLE_CATALOG'
-    value: '<catalog>'
-  - name: 'MODELS_TABLE_SCHEMA'
-    value: 'GOLD'    
-  - name: 'MODELS_TABLE_NAME'
-    value: 'REPORTINGMODELS'
+  # Table where the models are stored. It has just two fields - ModelName and ModelDefinition   
+  - name: 'PYDASH_APP_REPORTS_TABLE_NAME'
+    value: 'PYDASH_APP_REPORT'
+  - name: 'PYDASH_APP_REPORTING_CATALOGS'
+    value: 'testdata'
+  - name: 'APP_LOG_LEVEL'
+    value: 'INFO'
+  - name: 'DATABRICKS_HTTP_PATH'
+    value: '/sql/1.0/warehouses/50c52a56ac828f66'
+    

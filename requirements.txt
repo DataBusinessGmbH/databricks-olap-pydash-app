@@ -1,9 +1,8 @@
-dash==2.18.2
+dash==2.18.1
 pandas==2.2.3
 dash-ag-grid==31.2.0
-databricks-sql-connector==3.5.0
-python-dotenv==1.0.1
-PyYAML==6.0.2
-databricks-sdk
-databricks-connect==15.4.*
-pyspark
+databricks-sql-connector~=3.4.0
+databricks-sdk~=0.33.0
+python-dotenv~=1.2.1
+PyYAML~=6.0.2
+flask

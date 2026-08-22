@@ -252,3 +252,49 @@ class MetricViewDef:
 
     def fields_for_group(self, group_name: str) -> list[MvField]:
         return [f for f in self.fields if f.group_name == group_name]
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers for dcc.Store transport
+# ---------------------------------------------------------------------------
+
+def metric_view_def_to_dict(mvd: "MetricViewDef") -> dict:
+    """Serialize a MetricViewDef to a JSON-safe dict for storage in dcc.Store."""
+    return {
+        "model_id": mvd.model_id,
+        "catalog": mvd.catalog,
+        "schema": mvd.schema,
+        "metric_view_name": mvd.metric_view_name,
+        "display_name": mvd.display_name,
+        "fields": [
+            {
+                "name": f.name,
+                "label": f.label,
+                "field_type": f.field_type,
+                "group_name": f.group_name,
+                "default_show": f.default_show,
+            }
+            for f in mvd.fields
+        ],
+    }
+
+
+def metric_view_def_from_dict(d: dict) -> "MetricViewDef":
+    """Deserialize a MetricViewDef from a dcc.Store dict."""
+    return MetricViewDef(
+        model_id=d["model_id"],
+        catalog=d["catalog"],
+        schema=d["schema"],
+        metric_view_name=d["metric_view_name"],
+        display_name=d["display_name"],
+        fields=[
+            MvField(
+                name=f["name"],
+                label=f["label"],
+                field_type=f["field_type"],
+                group_name=f["group_name"],
+                default_show=f.get("default_show", True),
+            )
+            for f in d.get("fields", [])
+        ],
+    )
