@@ -1,2 +1,25 @@
 export DATABRICKS_HOST="adb-3788xxx363860xxx.1.azuredatabricks.net"  
 export DATABRICKS_TOKEN="dapi4ff71a4xxx9194397fd1eb0d35xxxbax-n"
+
+# ============================================================================
+# Entra ID Authentication Configuration
+# ============================================================================
+# Enable Entra ID authentication for non-Databricks environments (e.g., VMs)
+# 
+# Required fields (all three must be set to enable Entra auth):
+#   ENTRA_TENANT_ID - Azure Tenant ID (find in Azure Portal > Azure AD > Properties)
+#   ENTRA_CLIENT_ID - Application (client) ID from Azure App Registration
+#   ENTRA_REDIRECT_URI - OAuth2 redirect URI (e.g., http://localhost:5000/auth/callback)
+#
+# Optional:
+#   ENTRA_CLIENT_SECRET - Client secret (required for confidential clients)
+#   FLASK_SECRET_KEY - Flask session encryption key (auto-generated if not set)
+#
+# When running in a non-Databricks environment (missing DATABRICKS_TOKEN),
+# the app will automatically redirect users to Entra ID login if these vars are set.
+
+export ENTRA_TENANT_ID="98ca5764-0974-4494-9ed2-7b6cf7b83dbd"  
+export ENTRA_CLIENT_ID="0be0016c-f0c0-405f-b6b7-328834603ede"
+export ENTRA_CLIENT_SECRET="d25df223-dd28-4344-94f0-8cda321a6115"
+export ENTRA_REDIRECT_URI="http://localhost:5000/auth/callback"
+# export FLASK_SECRET_KEY="your-secret-key-here"  # Optional: auto-generated if not set

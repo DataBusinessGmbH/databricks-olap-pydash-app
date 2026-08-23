@@ -5,7 +5,7 @@ env:
   - name: 'PYDASH_APP_REPORTING_CATALOGS'
     value: 'testdata'
   - name: 'APP_LOG_LEVEL'
-    value: 'INFO'
+    value: 'DEBUG'
   - name: 'DATABRICKS_HTTP_PATH'
     value: '/sql/1.0/warehouses/50c52a56ac828f66'
     

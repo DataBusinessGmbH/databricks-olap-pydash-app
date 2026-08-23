@@ -29,6 +29,13 @@ import dash
 app = Dash(__name__)
 server = app.server
 
+# Configure Flask sessions for authentication
+server.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
+server.config["SESSION_COOKIE_SECURE"] = True  # Only send cookies over HTTPS
+server.config["SESSION_COOKIE_HTTPONLY"] = True  # Prevent JavaScript access
+server.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # CSRF protection
+server.config["PERMANENT_SESSION_LIFETIME"] = 43200  # 12 hours
+
 from src.model import MetricViewDef, MvField, metric_view_def_to_dict, metric_view_def_from_dict
 from src.db import (
     LOGGER,
@@ -63,6 +70,51 @@ def ensure_logging_visible() -> None:
         handler.setLevel(level)
 
 ensure_logging_visible()
+
+
+# ---------------------------------------------------------------------------
+# Authentication Middleware
+# ---------------------------------------------------------------------------
+
+def _setup_auth_middleware() -> None:
+    """Setup authentication middleware to check Entra auth requirement."""
+    from flask import redirect, session
+    from src.auth import is_entra_auth_required, detect_databricks_environment
+    
+    @server.before_request
+    def check_auth():
+        """
+        Check if authentication is required.
+        
+        If running in non-Databricks environment and Entra is configured,
+        redirect unauthenticated users to login.
+        """
+        # Allow auth routes and static files
+        path = flask_request.path
+        if path.startswith("/auth/") or path.startswith("/_") or path.startswith("/assets/"):
+            return None
+        
+        try:
+            # Check if Entra auth is required
+            if not is_entra_auth_required():
+                LOGGER.debug("Entra auth not required for path %s", path)
+                return None
+            
+            # Check if user has Entra token
+            entra_token = session.get("entra_token")
+            if entra_token:
+                LOGGER.debug("User authenticated with Entra token")
+                return None
+            
+            # Redirect to login
+            LOGGER.info("User not authenticated, redirecting to Entra login for path %s", path)
+            return redirect("/auth/login")
+        except Exception as e:
+            LOGGER.error("Error in auth middleware: %s", str(e), exc_info=True)
+            # On error, allow the request to continue (fail open for backward compatibility)
+            return None
+
+_setup_auth_middleware()
 
 
 def load_env_on_startup() -> None:
@@ -3772,6 +3824,133 @@ def on_grid_state_change(catalog_value,
     return result_df.to_dict("records"), new_col_defs
 
 
+# ---------------------------------------------------------------------------
+# Authentication Routes (Entra ID for non-Databricks environments)
+# ---------------------------------------------------------------------------
+
+from flask import redirect, url_for, session
+from src.auth import EntraAuthManager, EntraAuthConfig, is_entra_auth_required
+
+# Initialize Entra auth manager (if configured)
+_entra_config = EntraAuthConfig()
+_entra_manager = EntraAuthManager(_entra_config)
+
+
+@server.route("/auth/login", methods=["GET"])
+def auth_login():
+    """
+    Initiate Entra ID login flow.
+    
+    Redirects user to Entra ID authorization endpoint.
+    """
+    if not _entra_manager.is_configured():
+        LOGGER.error("Entra auth not configured; cannot initiate login")
+        return jsonify({"error": "Authentication not configured"}), 500
+    
+    try:
+        import uuid
+        # Generate state parameter for CSRF protection
+        state = str(uuid.uuid4())
+        session["auth_state"] = state
+        
+        auth_url = _entra_manager.get_auth_url(state=state)
+        LOGGER.info("Redirecting to Entra login")
+        return redirect(auth_url)
+    except Exception as e:
+        LOGGER.error("Failed to initiate Entra login: %s", str(e), exc_info=True)
+        return jsonify({"error": "Failed to initiate login"}), 500
+
+
+@server.route("/auth/callback", methods=["GET"])
+def auth_callback():
+    """
+    Handle Entra ID callback.
+    
+    Exchanges authorization code for access token and stores in session.
+    Redirects to home page on success.
+    """
+    try:
+        # Get auth code and state from query parameters
+        code = flask_request.args.get("code")
+        state = flask_request.args.get("state")
+        error = flask_request.args.get("error")
+        error_description = flask_request.args.get("error_description")
+        
+        # Check for Entra errors
+        if error:
+            LOGGER.error("Entra auth error: %s - %s", error, error_description)
+            return jsonify({
+                "error": error,
+                "description": error_description
+            }), 400
+        
+        # Validate state parameter
+        stored_state = session.get("auth_state")
+        if not state or state != stored_state:
+            LOGGER.error("State mismatch in auth callback")
+            return jsonify({"error": "Invalid state parameter"}), 400
+        
+        # Exchange code for token
+        if not code:
+            LOGGER.error("No authorization code in callback")
+            return jsonify({"error": "No authorization code"}), 400
+        
+        token_response = _entra_manager.exchange_code_for_token(code)
+        if not token_response or "access_token" not in token_response:
+            LOGGER.error("Failed to obtain access token from Entra")
+            return jsonify({"error": "Failed to obtain access token"}), 500
+        
+        # Store token in session
+        session["entra_token"] = token_response.get("access_token")
+        session["entra_token_expiry"] = token_response.get("expires_on")
+        session.permanent = True
+        
+        LOGGER.info("Successfully authenticated via Entra ID")
+        
+        # Redirect to home page
+        return redirect("/")
+    
+    except Exception as e:
+        LOGGER.error("Exception in auth callback: %s", str(e), exc_info=True)
+        return jsonify({"error": "Authentication failed"}), 500
+
+
+@server.route("/auth/logout", methods=["GET", "POST"])
+def auth_logout():
+    """
+    Logout user by clearing session.
+    """
+    try:
+        session.clear()
+        LOGGER.info("User logged out")
+        return redirect("/")
+    except Exception as e:
+        LOGGER.error("Exception in logout: %s", str(e), exc_info=True)
+        return jsonify({"error": "Logout failed"}), 500
+
+
+@server.route("/auth/status", methods=["GET"])
+def auth_status():
+    """
+    Check current authentication status.
+    
+    Returns JSON with auth status information.
+    """
+    try:
+        from src.auth import detect_databricks_environment
+        
+        in_databricks = detect_databricks_environment()
+        entra_configured = _entra_manager.is_configured()
+        entra_token = session.get("entra_token")
+        
+        return jsonify({
+            "in_databricks": in_databricks,
+            "entra_configured": entra_configured,
+            "entra_authenticated": bool(entra_token),
+        })
+    except Exception as e:
+        LOGGER.error("Exception in auth status: %s", str(e), exc_info=True)
+        return jsonify({"error": "Failed to get auth status"}), 500
 
 
 if __name__ == "__main__":

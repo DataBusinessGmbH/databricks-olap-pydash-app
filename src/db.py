@@ -24,7 +24,7 @@ import pandas as pd
 from databricks import sql
 
 def _setup_logger() -> logging.Logger:
-    level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+    level_name = os.getenv("APP_LOG_LEVEL", "DEBUG").upper()
     level = getattr(logging, level_name, logging.INFO)
     logger = logging.getLogger(__name__)
 
@@ -174,24 +174,78 @@ class DatabricksSqlBackend:
 
     @staticmethod
     def _token_from_request_header() -> str:
+        """
+        Retrieve Databricks access token from request headers, environment,
+        or (as a fallback) a cached Entra access token.
+
+        Order of lookup:
+        1. x-forwarded-access-token request header
+        2. DATABRICKS_TOKEN environment variable
+        3. EntraAuthManager.get_cached_access_token() if Entra auth is configured
+
+        Returns:
+        - Actual token if found
+        - Placeholder token if Entra auth is required (allows backend init to defer auth check)
+        - Empty string if Entra auth is not configured (backward compatible)
+        """
         token = ""
         try:
             LOGGER.debug("Attempting to extract token from request headers")
             token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
-            user  = flask_request.headers.get("x-forwarded-user"),
-            email = flask_request.headers.get("x-forwarded-email"),
-            LOGGER.debug("Extracted token from request header: %s, user: %s, email: %s", f"****({len(token)})" if token else None, user, email)
+            user = flask_request.headers.get("x-forwarded-user")
+            email = flask_request.headers.get("x-forwarded-email")
+            LOGGER.debug(
+                "Extracted token from request header: %s, user: %s, email: %s",
+                f"****({len(token)})" if token else None,
+                user,
+                email,
+            )
         except RuntimeError:
             # No active request context; fallback to env token below.
+            LOGGER.debug("No active request context; falling back to environment token")
             token = ""
 
         if not token:
             token = (os.getenv("DATABRICKS_TOKEN") or "").strip()
+            if not token:
+                LOGGER.debug("No Databricks token found in environment variable DATABRICKS_TOKEN")
 
+        # If still no token, attempt to consult Entra cached token (non-blocking)
         if not token:
-            raise RuntimeError(
-                "Missing Databricks access token: provide x-forwarded-access-token header or DATABRICKS_TOKEN env var."
-            )
+            LOGGER.debug("Checking EntraAuthManager for cached token")
+            try:
+                # Import locally to avoid import cycles at module import time
+                from .auth import EntraAuthManager
+
+                manager = EntraAuthManager()
+                if manager.is_configured():
+                    cached = manager.get_cached_access_token()
+                    if cached:
+                        token = cached.strip()
+                        LOGGER.debug("Using cached Entra access token from EntraAuthManager")
+                    else:
+                        LOGGER.debug("Entra auth configured but no cached token available")
+                else:
+                    LOGGER.debug("Entra auth manager not configured; skipping Entra fallback")
+            except Exception:
+                LOGGER.debug(
+                    "Failed to consult EntraAuthManager for fallback token", exc_info=True
+                )
+
+        # If still no token, check if Entra auth is required and return a placeholder
+        # This allows the backend to initialize in preparation for auth flow
+        if not token:
+            LOGGER.debug("No Databricks access token found in headers, env, or Entra cache")
+            try:
+                from .auth import is_entra_auth_required
+                if is_entra_auth_required():
+                    LOGGER.debug("Entra auth required; returning placeholder token to defer auth check")
+                    return "__PLACEHOLDER_ENTRA_TOKEN__"
+            except Exception:
+                LOGGER.debug(
+                    "Failed to check if Entra auth is required", exc_info=True
+                )
+
         return token
 
     def _connect(self):
@@ -201,6 +255,22 @@ class DatabricksSqlBackend:
             self._config.http_path,
         )
         access_token = self._token_from_request_header()
+        
+        # Check if we got a placeholder token (indicates Entra auth is required but user not yet authenticated)
+        if access_token == "__PLACEHOLDER_ENTRA_TOKEN__":
+            LOGGER.debug("Placeholder Entra token detected; user must authenticate first")
+            raise RuntimeError(
+                "Authentication required. Please log in via Entra ID. "
+                "You should have been redirected to the login page. "
+                "If not, navigate to /auth/login."
+            )
+        
+        if not access_token:
+            raise RuntimeError(
+                "Missing Databricks access token. Provide via x-forwarded-access-token header, "
+                "DATABRICKS_TOKEN env var, or authenticate via Entra ID."
+            )
+        
         connect_kwargs = {
             "server_hostname": self._config.server_hostname,
             "http_path": self._config.http_path,
