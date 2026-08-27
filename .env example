@@ -18,8 +18,12 @@ export DATABRICKS_TOKEN="dapi4ff71a4xxx9194397fd1eb0d35xxxbax-n"
 # When running in a non-Databricks environment (missing DATABRICKS_TOKEN),
 # the app will automatically redirect users to Entra ID login if these vars are set.
 
-export ENTRA_TENANT_ID="98ca5764-0974-4494-9ed2-7b6cf7b83dbd"  
-export ENTRA_CLIENT_ID="0be0016c-f0c0-405f-b6b7-328834603ede"
-export ENTRA_CLIENT_SECRET="d25df223-dd28-4344-94f0-8cda321a6115"
+export ENTRA_TENANT_ID=""  
+export ENTRA_CLIENT_ID=""
+export ENTRA_CLIENT_SECRET=""
+
 export ENTRA_REDIRECT_URI="http://localhost:5000/auth/callback"
-# export FLASK_SECRET_KEY="your-secret-key-here"  # Optional: auto-generated if not set
+#export ENTRA_REDIRECT_URI="https://<apphost>/auth/callback"
+
+export SESSION_COOKIE_SECURE="false"
+

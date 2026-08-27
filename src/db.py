@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from typing import Callable, Protocol
-from flask import request as flask_request
+from flask import request as flask_request, session
 import pandas as pd
 from databricks import sql
 
@@ -188,6 +188,7 @@ class DatabricksSqlBackend:
         - Placeholder token if Entra auth is required (allows backend init to defer auth check)
         - Empty string if Entra auth is not configured (backward compatible)
         """
+        LOGGER.debug("_token_from_request_header called")
         token = ""
         try:
             LOGGER.debug("Attempting to extract token from request headers")
@@ -209,6 +210,14 @@ class DatabricksSqlBackend:
             token = (os.getenv("DATABRICKS_TOKEN") or "").strip()
             if not token:
                 LOGGER.debug("No Databricks token found in environment variable DATABRICKS_TOKEN")
+
+        if not token:
+            try:
+                token = (session.get("entra_token") or "").strip()
+                if token:
+                    LOGGER.debug("Using Entra access token from Flask session")
+            except RuntimeError:
+                LOGGER.debug("No active request context; Flask session unavailable")
 
         # If still no token, attempt to consult Entra cached token (non-blocking)
         if not token:

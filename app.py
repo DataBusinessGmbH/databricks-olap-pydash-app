@@ -25,16 +25,7 @@ import dash_ag_grid as dag
 import pandas as pd
 from dash import ALL, Dash, Input, Output, State, dcc, html, no_update
 import dash
-
-app = Dash(__name__)
-server = app.server
-
-# Configure Flask sessions for authentication
-server.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
-server.config["SESSION_COOKIE_SECURE"] = True  # Only send cookies over HTTPS
-server.config["SESSION_COOKIE_HTTPONLY"] = True  # Prevent JavaScript access
-server.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # CSRF protection
-server.config["PERMANENT_SESSION_LIFETIME"] = 43200  # 12 hours
+import logging
 
 from src.model import MetricViewDef, MvField, metric_view_def_to_dict, metric_view_def_from_dict
 from src.db import (
@@ -47,7 +38,6 @@ from src.query_planner import (
     execute_olap_request as planner_execute_olap_request,
     fetch_filter_values as planner_fetch_filter_values,
 )
-import logging
 
 # ---------------------------------------------------------------------------
 # Bootstrap: load model, connect database layer
@@ -55,6 +45,23 @@ import logging
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORTS_DIR = BASE_DIR / "reports"
+
+# Initialize Dash app with assets folder
+app = Dash(__name__, assets_folder=str(BASE_DIR / "assets"))
+server = app.server
+
+# Server-side OAuth state store (stores state parameter for CSRF protection)
+_oauth_state_store: dict[str, dict] = {}
+
+# Configure Flask sessions for authentication
+server.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
+# Local Entra testing uses HTTP; deployments should set this to true.
+server.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "true").lower() in {
+    "1", "true", "yes", "on"
+}
+server.config["SESSION_COOKIE_HTTPONLY"] = True  # Prevent JavaScript access
+server.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # Standard CSRF protection
+server.config["PERMANENT_SESSION_LIFETIME"] = 43200  # 12 hours
 DEFAULT_MAX_ROWS = 1000
 STARTUP_WARNINGS: list[str] = []
 
@@ -1799,8 +1806,6 @@ def build_grid_options() -> dict:
 # ---------------------------------------------------------------------------
 # Dash layout
 # ---------------------------------------------------------------------------
-
-app = Dash(__name__, assets_folder=str(BASE_DIR / "assets"))
 
 
 @app.server.get("/api/filter-values")
@@ -3851,7 +3856,11 @@ def auth_login():
         import uuid
         # Generate state parameter for CSRF protection
         state = str(uuid.uuid4())
-        session["auth_state"] = state
+        
+        # Store state server-side (reliable for OAuth flow)
+        _oauth_state_store[state] = {"created_at": __import__("time").time()}
+        
+        LOGGER.info("Auth login - storing state server-side: %s", state)
         
         auth_url = _entra_manager.get_auth_url(state=state)
         LOGGER.info("Redirecting to Entra login")
@@ -3867,8 +3876,11 @@ def auth_callback():
     Handle Entra ID callback.
     
     Exchanges authorization code for access token and stores in session.
-    Redirects to home page on success.
+    Redirects to home page on success.    
     """
+
+    LOGGER.debug("Received Entra auth callback")
+
     try:
         # Get auth code and state from query parameters
         code = flask_request.args.get("code")
@@ -3884,11 +3896,13 @@ def auth_callback():
                 "description": error_description
             }), 400
         
-        # Validate state parameter
-        stored_state = session.get("auth_state")
-        if not state or state != stored_state:
-            LOGGER.error("State mismatch in auth callback")
+        # Validate state parameter against server-side store
+        if not state or state not in _oauth_state_store:
+            LOGGER.error("State not found in store. Received state: %s, Store keys: %s", state, list(_oauth_state_store.keys()))
             return jsonify({"error": "Invalid state parameter"}), 400
+        
+        # Clean up used state
+        del _oauth_state_store[state]
         
         # Exchange code for token
         if not code:
@@ -3952,6 +3966,15 @@ def auth_status():
         LOGGER.error("Exception in auth status: %s", str(e), exc_info=True)
         return jsonify({"error": "Failed to get auth status"}), 500
 
+@app.server.route("/healthz")
+def health():
+    return {"status": "healthy"}, 200
+
+@app.server.route("/readyz")
+def readiness():
+    # Initially just confirm that the process is ready.
+    # Later add lightweight dependency checks.
+    return {"status": "ready"}, 200
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=8050)

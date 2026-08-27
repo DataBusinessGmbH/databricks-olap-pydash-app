@@ -13,7 +13,7 @@ import os
 import logging
 from typing import Optional, Tuple
 from flask import request as flask_request
-from msal import PublicClientApplication
+from msal import ConfidentialClientApplication
 import json
 
 def _setup_logger() -> logging.Logger:
@@ -84,11 +84,16 @@ class EntraAuthManager:
             )
     
     def _initialize_app(self) -> None:
-        """Initialize the MSAL PublicClientApplication."""
+        """Initialize the MSAL ConfidentialClientApplication."""
         try:
             authority = f"https://login.microsoftonline.com/{self.config.tenant_id}"
-            self._app = PublicClientApplication(
+            LOGGER.debug("Initializing with: tenant=%s, client_id=%s, secret_len=%d", 
+                        self.config.tenant_id, self.config.client_id, 
+                        len(self.config.client_secret) if self.config.client_secret else 0)
+            
+            self._app = ConfidentialClientApplication(
                 client_id=self.config.client_id,
+                client_credential=self.config.client_secret,
                 authority=authority,
             )
             LOGGER.info(
@@ -145,6 +150,10 @@ class EntraAuthManager:
             raise RuntimeError("Entra authentication not configured")
         
         try:
+            LOGGER.debug("Exchanging code for token. Client ID: %s, Redirect URI: %s", 
+                        self.config.client_id, self.config.redirect_uri)
+            LOGGER.debug("Client secret length: %d chars", len(self.config.client_secret or ""))
+            
             token_response = self._app.acquire_token_by_authorization_code(
                 code=code,
                 scopes=[self.DATABRICKS_SCOPE],
@@ -190,6 +199,7 @@ def detect_databricks_environment() -> bool:
     Returns False if no token is found, indicating we're in a non-Databricks
     environment (e.g., VM) and need to force Entra authentication.
     """
+    LOGGER.debug("detect_databricks_environment called")
     try:
         # Check request headers first (for multi-tenant deployments)
         token = (flask_request.headers.get("x-forwarded-access-token") or "").strip()
@@ -220,6 +230,8 @@ def is_entra_auth_required() -> bool:
     
     Returns False otherwise (use existing Databricks token flow).
     """
+    LOGGER.debug("is_entra_auth_required called")
+    
     if detect_databricks_environment():
         LOGGER.debug("Databricks environment detected - Entra auth not required")
         return False
